@@ -10,7 +10,7 @@ Your game directory is never directly overwritten. Every mod file is installed a
 
 - **GUI and CLI** — a clean dark-themed desktop app (`sbmm_gui.py`) alongside the full-featured command-line tool (`sbmm.py`)
 - **Automatic mod structure detection** — handles all common Nexus Mods layouts, UE4SS mods, CNS `.json` configs, flat pak drops, and full game-tree paths
-- **Variant selection** — detects mods with multiple version folders (e.g. `Transparent/`, `Thicc/`) and prompts you to pick one at extract or enable time
+- **Variant selection** — detects mods with multiple version folders (e.g. `Green/`, `Blue/`) and prompts you to pick one at extract or enable time
 - **True asset-level conflict detection** — reads `.utoc` table-of-contents files to find mods that overwrite the exact same internal game assets, with no guesswork
 - **Interactive conflict resolution** — `--clean` walks through each conflicting pair and lets you pick a winner; your choices are persisted so you're never asked twice
 - **Integrity checking** — `--check` verifies every recorded symlink still exists and points to the right file
