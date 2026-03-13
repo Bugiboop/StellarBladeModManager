@@ -333,6 +333,7 @@ def prompt_conflict_resolution(mod_name: str, other_mod: str, conflicting_target
 
 def enable_mod(mod_name: str, cfg: dict, state: dict, target_map: dict = None, game_tree: set = None):
     mod_dir = cfg["mods_dir"] / mod_name
+    print(f"[enabling] {mod_name}")
     if not mod_dir.is_dir():
         print(f"[error] Mod directory not found: {mod_dir}")
         return

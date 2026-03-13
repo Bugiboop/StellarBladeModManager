@@ -55,7 +55,7 @@ def _display_name(folder: str) -> str:
 
 def _nexus_id(folder: str) -> str | None:
     """Extract the Nexus mod ID from a folder name like 'ModName-1234-1-0-...'"""
-    m = re.search(r"-(\d{3,6})(?:-\d+)+-\d{9,}$", folder)
+    m = re.search(r"-(\d{3,6})(?:-[A-Za-z]?\d+)+-\d{9,}$", folder)
     return m.group(1) if m else None
 
 
@@ -272,6 +272,16 @@ class _InteractiveDialog(ctk.CTkToplevel):
             justify="left", anchor="nw", wraplength=520,
         ).grid(row=0, column=0, sticky="w", padx=6, pady=4)
 
+        # Bind Linux scroll wheel to the context scrollable frame
+        _cv = ctx_scroll._parent_canvas
+        def _bind_scroll(w):
+            w.bind("<Button-4>", lambda _: _cv.yview_scroll(-1, "units"), add="+")
+            w.bind("<Button-5>", lambda _: _cv.yview_scroll( 1, "units"), add="+")
+            for child in w.winfo_children():
+                _bind_scroll(child)
+        _bind_scroll(ctx_outer)
+        _bind_scroll(self)
+
         # ── Radio buttons ─────────────────────────────────────────────
         radio_frame = ctk.CTkFrame(self, fg_color="transparent")
         radio_frame.grid(row=1, column=0, sticky="ew", padx=20, pady=(4, 0))
@@ -353,8 +363,31 @@ class App(ctk.CTk):
         self._poll_after     = None   # pending cursor-poll callback
         self._nexus_cache:    dict = {}  # nid → fetched API data
         self._nexus_fetching: set  = set()  # nids currently in-flight
+
+        # Pre-load disk cache so display names are correct on first render
+        # and already-cached mods never need a background fetch thread.
+        if _NEXUS_CACHE_DIR.exists():
+            for _p in _NEXUS_CACHE_DIR.glob("*.json"):
+                try:
+                    _nid  = _p.stem
+                    _data = json.loads(_p.read_text())
+                    # Restore cached image path — _cached_image is never written
+                    # to disk, so reconstruct it from the picture_url extension.
+                    if not _data.get("_cached_image"):
+                        _pic_url = _data.get("picture_url", "")
+                        if _pic_url:
+                            _ext = _pic_url.rsplit(".", 1)[-1].split("?")[0].lower()
+                            if _ext not in ("jpg", "jpeg", "png", "webp"):
+                                _ext = "jpg"
+                            _img = _NEXUS_CACHE_DIR / f"{_nid}.{_ext}"
+                            if _img.exists():
+                                _data["_cached_image"] = str(_img)
+                    self._nexus_cache[_nid] = _data
+                except Exception:
+                    pass
         self._archived:       dict = {}  # stem → Path for archives with no extracted folder
         self._name_labels:    dict = {}  # mod name → CTkLabel (for live Nexus name update)
+        self._sort_var = ctk.StringVar(value="Name A→Z")
 
         self._build_sidebar()
         self._build_main()
@@ -372,11 +405,11 @@ class App(ctk.CTk):
                           fg_color=("gray90", "gray15"))
         sb.grid(row=0, column=0, sticky="nsew")
         sb.grid_propagate(False)
-        sb.grid_rowconfigure(1, weight=1)
+        sb.grid_rowconfigure(2, weight=1)
         sb.grid_columnconfigure(0, weight=1)
 
         hdr = ctk.CTkFrame(sb, fg_color="transparent")
-        hdr.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 6))
+        hdr.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 4))
         hdr.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(hdr, text="MODS",
@@ -396,23 +429,40 @@ class App(ctk.CTk):
             command=self._open_settings,
         ).grid(row=0, column=3, sticky="e", padx=(6, 0))
 
+        # Sort control
+        sort_bar = ctk.CTkFrame(sb, fg_color="transparent")
+        sort_bar.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 4))
+        sort_bar.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(sort_bar, text="Sort",
+                     font=ctk.CTkFont(size=11),
+                     text_color=("gray50", "gray55"),
+                     ).grid(row=0, column=0, sticky="w")
+        ctk.CTkOptionMenu(
+            sort_bar,
+            values=["Name A→Z", "Name Z→A", "Enabled first", "Disabled first"],
+            variable=self._sort_var,
+            width=160, height=24,
+            font=ctk.CTkFont(size=11),
+            command=lambda _: self.refresh_mods(),
+        ).grid(row=0, column=1, sticky="e")
+
         self._mod_list = ctk.CTkScrollableFrame(
             sb, fg_color="transparent",
             scrollbar_button_color=("gray70", "gray30"),
             scrollbar_button_hover_color=("gray60", "gray40"),
         )
-        self._mod_list.grid(row=1, column=0, sticky="nsew", padx=6)
+        self._mod_list.grid(row=2, column=0, sticky="nsew", padx=6)
         self._mod_list.grid_columnconfigure(0, weight=1)
         # Bind scroll wheel to the frame itself (catches events on empty area)
         self._bind_scroll(self._mod_list, self._mod_list)
 
         btns = ctk.CTkFrame(sb, fg_color="transparent")
-        btns.grid(row=2, column=0, sticky="ew", padx=12, pady=12)
+        btns.grid(row=3, column=0, sticky="ew", padx=12, pady=12)
         btns.grid_columnconfigure((0, 1), weight=1)
 
         ctk.CTkButton(
             btns, text="Enable All", height=34,
-            command=lambda: self._run_bg(["--enable"], on_done=self.refresh_mods),
+            command=lambda: self._run_interactive(["--enable"], on_done=self.refresh_mods),
         ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
 
         ctk.CTkButton(
@@ -461,11 +511,21 @@ class App(ctk.CTk):
                             fg_color=("gray95", "gray12"))
         main.grid(row=0, column=1, sticky="nsew")
         main.grid_columnconfigure(0, weight=1)
-        main.grid_rowconfigure(0, weight=7)   # info
-        main.grid_rowconfigure(1, weight=3)   # log
+        main.grid_rowconfigure(0, weight=1)   # info expands to fill remaining space
 
         self._build_info_panel(main)
-        self._build_log_panel(main)
+        log_outer = self._build_log_panel(main)
+        log_outer.grid_propagate(False)       # fix log panel at explicit height
+
+        _last_h = [0]
+        def _resize(_=None):
+            h = main.winfo_height()
+            if h < 2 or h == _last_h[0]:
+                return
+            _last_h[0] = h
+            log_outer.configure(height=int(h * 0.30))
+
+        main.bind("<Configure>", _resize)
 
     # ── Info panel ────────────────────────────────────────────────────
 
@@ -511,6 +571,7 @@ class App(ctk.CTk):
         )
         self._info_scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=(6, 4))
         self._info_scroll.grid_columnconfigure(0, weight=1)
+        self._bind_scroll(self._info_scroll, self._info_scroll)
 
         # Initial placeholder
         self._show_info_placeholder("← Select a mod to view details")
@@ -922,6 +983,9 @@ class App(ctk.CTk):
                         lbl.configure(text=nexus_name)
                     except Exception:
                         pass
+            # Re-sort if a new mod name just arrived (only uncached mods reach here)
+            if self._sort_var.get() in ("Name A→Z", "Name Z→A"):
+                self.refresh_mods()
         # Refresh info panel if this mod is focused
         if self._focused and _nexus_id(self._focused) == nid:
             self._update_info_panel(self._focused)
@@ -948,7 +1012,7 @@ class App(ctk.CTk):
         win.minsize(480, 440)
         win.resizable(True, True)
         win.transient(self)
-        win.grab_set()
+        win.withdraw()          # hide until fully built (prevents blank flash on Linux)
         self._settings_win = win
         win.grid_columnconfigure(0, weight=1)
         win.grid_rowconfigure(0, weight=1)
@@ -1136,6 +1200,14 @@ class App(ctk.CTk):
                       command=win.destroy,
                       ).grid(row=0, column=2, padx=(0, 12), pady=8, sticky="e")
 
+        # Show the window now that all widgets are built (prevents blank CTkToplevel on Linux)
+        def _show_win():
+            win.deiconify()
+            win.grab_set()
+            win.lift()
+            win.focus_force()
+        win.after(50, _show_win)
+
     def _open_mod_folder(self):
         if self._folder_path and self._folder_path.is_dir():
             subprocess.Popen(["xdg-open", str(self._folder_path)])
@@ -1300,8 +1372,13 @@ class App(ctk.CTk):
             ("Uninstall",  ["--uninstall"],  "uninstall"),
         ]
 
+        cols = 4
+        for col in range(cols):
+            act.grid_columnconfigure(col, weight=1)
+
         for i, (label, cmd_args, kind) in enumerate(actions):
-            act.grid_columnconfigure(i, weight=1)
+            row_i = i // cols
+            col_i = i % cols
 
             if kind == "uninstall":
                 fg, hv = "#c0392b", "#922b21"
@@ -1321,7 +1398,11 @@ class App(ctk.CTk):
             if hv:
                 kw["hover_color"] = hv
 
-            ctk.CTkButton(act, **kw).grid(row=0, column=i, padx=3, sticky="ew")
+            ctk.CTkButton(act, **kw).grid(
+                row=row_i, column=col_i, padx=3, pady=(0, 3), sticky="ew"
+            )
+
+        return outer
 
     # ── Status bar ────────────────────────────────────────────────────
 
@@ -1358,7 +1439,21 @@ class App(ctk.CTk):
             if mods_dir.exists() else set()
         )
         tracked  = set(state["mods"].keys())
-        all_mods = sorted(self._on_disk | tracked)
+        sort_mode = self._sort_var.get()
+        def _disp_key(n):
+            return self._get_disp_name(n).lower()
+        if sort_mode == "Name Z→A":
+            all_mods = sorted(self._on_disk | tracked, key=_disp_key, reverse=True)
+        elif sort_mode == "Enabled first":
+            all_mods = sorted(self._on_disk | tracked,
+                              key=lambda n: (not state["mods"].get(n, {}).get("enabled", False),
+                                             _disp_key(n)))
+        elif sort_mode == "Disabled first":
+            all_mods = sorted(self._on_disk | tracked,
+                              key=lambda n: (state["mods"].get(n, {}).get("enabled", False),
+                                             _disp_key(n)))
+        else:  # "Name A→Z"
+            all_mods = sorted(self._on_disk | tracked, key=_disp_key)
 
         # Archives in compressed/ that haven't been extracted yet
         compressed_dir = cfg.get("compressed_dir")
@@ -1682,7 +1777,7 @@ class App(ctk.CTk):
 
         def worker():
             for name in names:
-                cmd = [str(python), str(SBMM), flag, name]
+                cmd = [str(python), "-u", str(SBMM), flag, name]
                 try:
                     proc = subprocess.Popen(
                         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1710,7 +1805,7 @@ class App(ctk.CTk):
         python = SCRIPT_DIR / ".venv" / "bin" / "python"
         if not python.exists():
             python = sys.executable
-        cmd = [str(python), str(SBMM)] + args
+        cmd = [str(python), "-u", str(SBMM)] + args
 
         self._log_write(f"\n$ sbmm {' '.join(args)}\n", bold=True)
         self._busy.configure(text="⏳ Running…")
@@ -1743,10 +1838,14 @@ class App(ctk.CTk):
 
                 if ch == "\n":
                     self.after(0, self._log_write, line_buf)
-                    context_buf += line_buf
-                    # Keep only the last 30 lines as context for dialogs
-                    context_buf = "".join(
-                        context_buf.splitlines(keepends=True)[-30:])
+                    # Section markers (new mod being processed) → fresh context
+                    if re.match(r"^\[(?:enabling|extract)\b", line_buf):
+                        context_buf = line_buf
+                    else:
+                        context_buf += line_buf
+                        # Keep only the last 15 lines as context for dialogs
+                        context_buf = "".join(
+                            context_buf.splitlines(keepends=True)[-15:])
                     line_buf = ""
                 else:
                     result = _detect_prompt(line_buf)
@@ -1774,7 +1873,7 @@ class App(ctk.CTk):
 
                         self.after(0, self._log_write,
                                    f"{line_buf}{answer}\n")
-                        context_buf += line_buf + answer + "\n"
+                        context_buf = ""   # reset so next prompt only shows fresh output
                         line_buf = ""
 
                         try:
@@ -1832,7 +1931,7 @@ class App(ctk.CTk):
         python = SCRIPT_DIR / ".venv" / "bin" / "python"
         if not python.exists():
             python = sys.executable
-        cmd = [str(python), str(SBMM)] + args
+        cmd = [str(python), "-u", str(SBMM)] + args
 
         self._log_write(f"\n$ sbmm {' '.join(args)}\n", bold=True)
         self._busy.configure(text="⏳ Running…")

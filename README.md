@@ -9,12 +9,14 @@ Your game directory is never directly overwritten. Every mod file is installed a
 ## Features
 
 - **GUI and CLI** — a clean dark-themed desktop app (`sbmm_gui.py`) alongside the full-featured command-line tool (`sbmm.py`)
+- **Nexus Mods integration** — fetches mod names, descriptions, authors, and cover art automatically using your Nexus API key; results are cached locally
 - **Automatic mod structure detection** — handles all common Nexus Mods layouts, UE4SS mods, CNS `.json` configs, flat pak drops, and full game-tree paths
-- **Variant selection** — detects mods with multiple version folders (e.g. `Green/`, `Blue/`) and prompts you to pick one at extract or enable time
+- **Variant selection** — detects mods with multiple version folders (e.g. `Green/`, `Blue/`) and shows a GUI dialog to pick one at extract or enable time
 - **True asset-level conflict detection** — reads `.utoc` table-of-contents files to find mods that overwrite the exact same internal game assets, with no guesswork
-- **Interactive conflict resolution** — `--clean` walks through each conflicting pair and lets you pick a winner; your choices are persisted so you're never asked twice
+- **Interactive conflict resolution** — `--clean` walks through each conflicting pair with a radio-button dialog; your choices are persisted so you're never asked twice
 - **Integrity checking** — `--check` verifies every recorded symlink still exists and points to the right file
 - **Safe uninstall** — all symlinks removed, all `.bak` files restored in one command
+- **Settings window** — configure your Nexus API key, game paths, and appearance without editing files directly
 
 ---
 
@@ -22,8 +24,9 @@ Your game directory is never directly overwritten. Every mod file is installed a
 
 | Requirement | Notes |
 |---|---|
-| Python 3.8+ | |
+| Python 3.10+ | |
 | `customtkinter` | GUI only — installed into `.venv` (see below) |
+| `Pillow` | GUI only — for cover art display |
 | `p7zip-full` | Only needed for `.rar` / `.7z` archives |
 
 ```bash
@@ -40,7 +43,7 @@ cd StellarBladeModManager
 
 # Create the virtual environment and install GUI dependencies
 python3 -m venv .venv
-.venv/bin/pip install customtkinter
+.venv/bin/pip install customtkinter Pillow
 ```
 
 Then edit `config.json` to point at your game:
@@ -63,11 +66,14 @@ Then edit `config.json` to point at your game:
 .venv/bin/python sbmm_gui.py
 ```
 
-- Click a mod card to **select** it (blue highlight); click again to deselect
-- Use **Enable Selected / Disable Selected** to batch-control any subset of mods
-- Toggle switches for individual mods; **Enable All / Disable All** for everything
-- Buttons at the bottom of the output panel run CLI commands and stream their output live
-- Commands that need interactive input (Install, Extract, Clean) open a terminal window automatically
+- The left sidebar lists all mods — **click** a card to view its info; **check the checkbox** to batch-select
+- **Enable All / Disable All** toggle everything; **Enable Selected / Disable Selected** act on checked mods
+- Individual switches enable/disable single mods
+- The **⚙ settings button** (top of sidebar) opens a settings window for API key, paths, and theme
+- The **info panel** shows mod metadata, cover art (fetched from Nexus if an API key is set), a folder button, and a Nexus link
+- Hovering the cover art shows it full-size in a floating overlay
+- The **output panel** at the bottom streams live command output; interactive prompts (variant selection, conflict resolution) open GUI dialogs automatically
+- Arrow keys (↑ / ↓) navigate the mod list; the scroll wheel works throughout
 
 ### CLI
 
@@ -92,21 +98,34 @@ python sbmm.py --uninstall        # remove all symlinks, restore backups
 
 ---
 
+## Nexus Mods Integration
+
+The GUI can automatically fetch mod metadata (name, author, version, description, cover image) from the Nexus Mods API. To enable it:
+
+1. Open Settings (⚙ button) → paste your API key in the **API Key** field
+2. A link to [nexusmods.com/settings/api-keys](https://www.nexusmods.com/settings/api-keys) is provided in the settings window
+3. Click **Save** — the app will start fetching data for all mods with a recognised Nexus ID in their folder name
+
+API responses and cover images are cached in `.nexus_cache/` so subsequent launches are instant. You can clear the cache from the Settings window at any time.
+
+---
+
 ## Directory Layout
 
 ```
 StellarBladeModManager/
 ├── sbmm.py               # CLI mod manager
 ├── sbmm_gui.py           # GUI frontend
-├── config.json           # your configuration (edit this)
+├── config.json           # your configuration (edit this or use Settings)
 ├── state.json            # auto-managed — tracks symlinks, backups, conflict choices
-├── .venv/                # Python virtual environment (GUI dependency)
+├── .venv/                # Python virtual environment (GUI dependencies)
+├── .nexus_cache/         # cached Nexus API responses and cover images
 ├── compressed/           # drop .zip / .rar / .7z archives here
 ├── compressed-disabled/  # archives moved here when --clean removes a mod
 └── mods/                 # extracted mod folders
 ```
 
-> `state.json`, `.venv/`, `compressed/`, and `mods/` are in `.gitignore` — they are local to each install and should not be committed.
+> `state.json`, `.venv/`, `.nexus_cache/`, `compressed/`, and `mods/` are in `.gitignore` — they are local to each install and should not be committed.
 
 ---
 
@@ -141,24 +160,9 @@ Read-only report of which mods are competing for the same target path right now.
 
 Reads the `.utoc` (IoStore table-of-contents) file inside each mod and extracts every internal asset path the mod modifies. Reports pairs of mods that overwrite the exact same UE5 asset — no filename heuristics, no guesswork.
 
-```
-ASSET-LEVEL CONFLICTS (2 mod pair(s), 10 shared asset(s))
-──────────────────────────────────────────────────────────
-  ModA
-        - ModA_outfit_P
-  ModB
-        - ModB_outfit_P
-  8 shared asset(s):
-    Art/Character/PC/CH_P_EVE/
-      CH_EVE_BaseBody_V02_F1_A.uasset
-      CH_EVE_BaseBody_V02_F1_N.uasset
-      ...
-  Keep which? [1/2/s=skip once/a=always keep both]:
-```
-
 ### Interactive resolution — `--clean`
 
-Runs the same asset scan, then walks you through each conflict:
+Runs the same asset scan, then walks you through each conflict with a GUI radio-button dialog:
 
 - **`1` or `2`** — delete the loser. Single mods lose their whole folder (archive moved to `compressed-disabled/`). Collection mods (>10 paks) only lose the specific conflicting pak triplets.
 - **`s`** — skip this pair for now.
@@ -168,14 +172,13 @@ Runs the same asset scan, then walks you through each conflict:
 
 ## Variant Selection
 
-When a mod ships with multiple version subfolders (e.g. `1 Heavier Physics/`, `2 Thicc/`, `3 Original/`), the script detects the pattern and prompts at **extract time** and **enable time**:
+When a mod ships with multiple version subfolders (e.g. `1 Heavier Physics/`, `2 Thicc/`, `3 Original/`), the script detects the pattern and shows a GUI dialog at **extract time** and **enable time**:
 
 ```
 [variants] 'CNS TsMaids' contains 3 versions — pick one to keep:
   (1) 1 Heavier physics Thicc  (4 mod file(s))
   (2) 2 Thicc                  (4 mod file(s))
   (3) 3 Original body shape    (4 mod file(s))
-  Keep which? [1-3/a=keep all/s=skip]:
 ```
 
 Unchosen folders are deleted immediately so they can never create phantom conflicts.
@@ -200,7 +203,7 @@ When a mod must replace a file that already exists in the game directory, the or
 
 ## Contributing
 
-Issues and pull requests are welcome. The project is a single-file CLI (`sbmm.py`) plus a single-file GUI frontend (`sbmm_gui.py`) with no runtime dependencies beyond the standard library (and `customtkinter` for the GUI).
+Issues and pull requests are welcome. The project is a single-file CLI (`sbmm.py`) plus a single-file GUI frontend (`sbmm_gui.py`) with no runtime dependencies beyond the standard library (and `customtkinter` + `Pillow` for the GUI).
 
 Before submitting a PR:
 - Test `--install`, `--disable`, `--enable`, and `--check` against a real mod setup
