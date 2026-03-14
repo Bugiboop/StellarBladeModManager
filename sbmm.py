@@ -278,7 +278,7 @@ def resolve_target(mod_root: Path, file_path: Path, game_root: Path, game_tree: 
     return game_root / "SB" / "Content" / "Paks" / "~mods" / file_path.name
 
 
-IGNORED_FILENAMES = {"modinfo.ini", "1.png"}
+IGNORED_FILENAMES = {"modinfo.ini", "1.png", "mods.txt"}
 
 def iter_mod_files(mod_dir: Path):
     """Yield all regular files inside a mod directory, skipping known metadata files."""
@@ -287,6 +287,72 @@ def iter_mod_files(mod_dir: Path):
             if fname.lower() in IGNORED_FILENAMES:
                 continue
             yield Path(root) / fname
+
+
+def _find_ue4ss_mod_names(mod_dir: Path) -> list:
+    """Return the UE4SS mod folder names found under any ue4ss/Mods/ subtree."""
+    names = []
+    for root, dirs, _files in os.walk(mod_dir):
+        root_path = Path(root)
+        if root_path.name.lower() == "mods" and root_path.parent.name.lower() == "ue4ss":
+            names.extend(dirs)
+            break  # only the first ue4ss/Mods/ matters
+    return names
+
+
+def _game_mods_txt(game_root: Path) -> Path:
+    return game_root / "SB" / "Binaries" / "Win64" / "ue4ss" / "Mods" / "mods.txt"
+
+
+def _register_ue4ss_mods(names: list, game_root: Path) -> list:
+    """Add 'Name : 1' entries to the game's mods.txt for any name not already present.
+    Returns the list of names actually added."""
+    if not names:
+        return []
+    mods_txt = _game_mods_txt(game_root)
+    if not mods_txt.exists() or mods_txt.is_symlink():
+        return []
+    try:
+        text = mods_txt.read_text()
+    except Exception:
+        return []
+    existing = {line.split(":")[0].strip().lower()
+                for line in text.splitlines()
+                if line.strip() and not line.strip().startswith(";")}
+    added = []
+    new_lines = text.rstrip("\n") + "\n"
+    for name in names:
+        if name.lower() not in existing:
+            new_lines += f"{name} : 1\n"
+            added.append(name)
+    if added:
+        try:
+            mods_txt.write_text(new_lines)
+        except Exception as e:
+            print(f"  [warn] Could not update mods.txt: {e}")
+            return []
+    return added
+
+
+def _unregister_ue4ss_mods(names: list, game_root: Path):
+    """Remove named entries from the game's mods.txt."""
+    if not names:
+        return
+    mods_txt = _game_mods_txt(game_root)
+    if not mods_txt.exists() or mods_txt.is_symlink():
+        return
+    try:
+        lines = mods_txt.read_text().splitlines(keepends=True)
+    except Exception:
+        return
+    lower_names = {n.lower() for n in names}
+    new_lines = [l for l in lines
+                 if not (l.strip() and not l.strip().startswith(";")
+                         and l.split(":")[0].strip().lower() in lower_names)]
+    try:
+        mods_txt.write_text("".join(new_lines))
+    except Exception as e:
+        print(f"  [warn] Could not update mods.txt: {e}")
 
 
 def build_target_map(state: dict) -> dict:
@@ -414,12 +480,21 @@ def enable_mod(mod_name: str, cfg: dict, state: dict, target_map: dict = None, g
         target_map[str(target)] = mod_name
         symlinks.append({"link": str(target), "target": str(src_file)})
 
+    # Register any UE4SS mod subfolders in the game's mods.txt
+    ue4ss_names = _find_ue4ss_mod_names(mod_dir)
+    added = _register_ue4ss_mods(ue4ss_names, game_root)
+    if added:
+        mod_state["ue4ss_mods"] = added
+        print(f"  [ue4ss] Registered in mods.txt: {', '.join(added)}")
+
     mod_state["enabled"] = True
     mod_state["symlinks"] = symlinks
     mod_state["backups"] = backups
     save_state(state)
 
     parts = [f"{len(symlinks)} linked"]
+    if added:
+        parts.append(f"{len(added)} ue4ss registered")
     if backups:
         parts.append(f"{len(backups)} backed up")
     print(f"[enabled]  {mod_name}  —  {', '.join(parts)}")
@@ -454,12 +529,20 @@ def disable_mod(mod_name: str, cfg: dict, state: dict):
         else:
             print(f"  [warn] backup not found: {bak.name}")
 
+    # Unregister any UE4SS mods we previously added to mods.txt
+    ue4ss_names = mod_state.pop("ue4ss_mods", [])
+    if ue4ss_names:
+        _unregister_ue4ss_mods(ue4ss_names, cfg["game_root"])
+        print(f"  [ue4ss] Removed from mods.txt: {', '.join(ue4ss_names)}")
+
     mod_state["enabled"] = False
     mod_state["symlinks"] = []
     mod_state["backups"] = []
     save_state(state)
 
     parts = [f"{unlinked} unlinked"]
+    if ue4ss_names:
+        parts.append(f"{len(ue4ss_names)} ue4ss unregistered")
     if restored:
         parts.append(f"{restored} restored")
     print(f"[disabled] {mod_name}  —  {', '.join(parts)}")

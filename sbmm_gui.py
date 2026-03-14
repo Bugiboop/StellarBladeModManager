@@ -42,6 +42,12 @@ _CARD_NORMAL   = ("gray80", "gray22")
 _CARD_FOCUSED  = ("gray74", "gray28")      # info panel active, single-click
 _CARD_CHECKED  = ("#1a4a72", "#1a4a72")    # checked for batch ops
 
+# Virtual mod list geometry
+_CARD_H = 52   # card row height in pixels
+_SEP_H  = 34   # separator row height
+_V_PAD  = 2    # vertical gap between rows
+_V_BUF  = 4    # extra rows rendered above/below viewport
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
@@ -53,10 +59,14 @@ def _display_name(folder: str) -> str:
     return re.sub(r"[-_]\d+(?:[-_]\d+)*$", "", folder).strip("-_ ") or folder
 
 
+_nexus_id_cache: dict[str, str | None] = {}
+
 def _nexus_id(folder: str) -> str | None:
     """Extract the Nexus mod ID from a folder name like 'ModName-1234-1-0-...'"""
-    m = re.search(r"-(\d{3,6})(?:-[A-Za-z]?\d+)+-\d{9,}$", folder)
-    return m.group(1) if m else None
+    if folder not in _nexus_id_cache:
+        m = re.search(r"-(\d{3,6})(?:-[A-Za-z]?\d+)+-\d{9,}$", folder)
+        _nexus_id_cache[folder] = m.group(1) if m else None
+    return _nexus_id_cache[folder]
 
 
 _ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"}
@@ -205,7 +215,49 @@ def _read_mod_info(mod_dir: Path) -> dict:
     stems = sorted({p.stem for p in paks})
     info["pak_stems"] = stems
 
+    # ── UE4SS mod folders ──────────────────────────────────────────────
+    ue4ss_mods = []
+    for p in mod_dir.rglob("*"):
+        if p.is_dir() and p.name.lower() == "mods" and p.parent.name.lower() == "ue4ss":
+            ue4ss_mods = sorted(d.name for d in p.iterdir() if d.is_dir())
+            break
+    info["ue4ss_mods"] = ue4ss_mods
+
+    # ── Non-pak script/config files (for UE4SS mods with no paks) ──────
+    if not stems and ue4ss_mods:
+        script_exts = {".lua", ".txt", ".ini", ".cfg", ".json"}
+        scripts = sorted({
+            f.name for f in mod_dir.rglob("*")
+            if f.is_file() and f.suffix.lower() in script_exts
+            and f.name.lower() not in ("mods.txt", "modinfo.ini")
+        })
+        info["script_files"] = scripts
+
     return info
+
+
+def _utoc_assets(utoc_path: Path) -> list:
+    """Extract internal UE5 asset paths from an IoStore .utoc file."""
+    ASSET_EXTS = {".uasset", ".ubulk", ".uexp", ".umap", ".uptnl"}
+    with open(utoc_path, "rb") as f:
+        data = f.read()
+    strings, current = [], []
+    for byte in data:
+        if 0x20 <= byte < 0x7F:
+            current.append(chr(byte))
+        else:
+            if len(current) >= 4:
+                strings.append("".join(current))
+            current = []
+    if len(current) >= 4:
+        strings.append("".join(current))
+    assets, current_dir = [], ""
+    for s in strings:
+        if s.startswith("../") or (s.startswith("/") and "/" in s[1:]):
+            current_dir = s.rstrip("/")
+        elif Path(s).suffix.lower() in ASSET_EXTS:
+            assets.append(f"{current_dir}/{s}" if current_dir else s)
+    return assets
 
 
 # ---------------------------------------------------------------------------
@@ -363,16 +415,39 @@ class App(ctk.CTk):
         self._poll_after     = None   # pending cursor-poll callback
         self._nexus_cache:    dict = {}  # nid → fetched API data
         self._nexus_fetching: set  = set()  # nids currently in-flight
+        self._archived:       dict = {}  # stem → Path for archives with no extracted folder
+        self._name_labels:    dict = {}  # mod name → CTkLabel (for live Nexus name update)
+        self._sort_var = ctk.StringVar(value="Name A→Z")
+        self._cfg:            dict = {}  # cached config, updated by refresh_mods
+        self._state:          dict = {"mods": {}}  # cached state, updated by refresh_mods
+        self._mod_info_cache: dict = {}   # mod_dir path → _read_mod_info result
+        self._assets_cache:   dict = {}   # mod_dir path → list of asset strings
+        # Virtual mod list state
+        self._vlist_items:        list     = []   # item dicts in display order
+        self._vlist_yoffs:        list     = []   # y pixel offset for each item
+        self._vlist_total_h:      int      = 0    # total canvas scroll height
+        self._vlist_widgets:      dict     = {}   # idx → {"frame": CTkFrame, "cid": int}
+        self._vlist_render_after: str|None = None # pending debounce id
 
-        # Pre-load disk cache so display names are correct on first render
-        # and already-cached mods never need a background fetch thread.
+        self._build_sidebar()
+        self._build_main()
+        self._build_statusbar()
+
+        self.bind_all("<Up>",   self._on_arrow_key)
+        self.bind_all("<Down>", self._on_arrow_key)
+
+        # Load nexus disk cache in a background thread so the window appears
+        # immediately, then populate the mod list once the cache is ready.
+        threading.Thread(target=self._preload_nexus_cache, daemon=True).start()
+
+    def _preload_nexus_cache(self):
+        """Read all cached Nexus JSON files from disk (background thread)."""
+        cache = {}
         if _NEXUS_CACHE_DIR.exists():
             for _p in _NEXUS_CACHE_DIR.glob("*.json"):
                 try:
                     _nid  = _p.stem
                     _data = json.loads(_p.read_text())
-                    # Restore cached image path — _cached_image is never written
-                    # to disk, so reconstruct it from the picture_url extension.
                     if not _data.get("_cached_image"):
                         _pic_url = _data.get("picture_url", "")
                         if _pic_url:
@@ -382,20 +457,13 @@ class App(ctk.CTk):
                             _img = _NEXUS_CACHE_DIR / f"{_nid}.{_ext}"
                             if _img.exists():
                                 _data["_cached_image"] = str(_img)
-                    self._nexus_cache[_nid] = _data
+                    cache[_nid] = _data
                 except Exception:
                     pass
-        self._archived:       dict = {}  # stem → Path for archives with no extracted folder
-        self._name_labels:    dict = {}  # mod name → CTkLabel (for live Nexus name update)
-        self._sort_var = ctk.StringVar(value="Name A→Z")
+        self.after(0, lambda: self._finish_startup(cache))
 
-        self._build_sidebar()
-        self._build_main()
-        self._build_statusbar()
-
-        self.bind_all("<Up>",   self._on_arrow_key)
-        self.bind_all("<Down>", self._on_arrow_key)
-
+    def _finish_startup(self, cache: dict):
+        self._nexus_cache.update(cache)
         self.refresh_mods()
 
     # ── Sidebar ───────────────────────────────────────────────────────
@@ -446,15 +514,23 @@ class App(ctk.CTk):
             command=lambda _: self.refresh_mods(),
         ).grid(row=0, column=1, sticky="e")
 
-        self._mod_list = ctk.CTkScrollableFrame(
-            sb, fg_color="transparent",
-            scrollbar_button_color=("gray70", "gray30"),
-            scrollbar_button_hover_color=("gray60", "gray40"),
+        list_outer = ctk.CTkFrame(sb, fg_color="transparent")
+        list_outer.grid(row=2, column=0, sticky="nsew", padx=6)
+        list_outer.grid_rowconfigure(0, weight=1)
+        list_outer.grid_columnconfigure(0, weight=1)
+
+        self._vlist_canvas = tk.Canvas(
+            list_outer, highlightthickness=0, bd=0, bg="#242424",
         )
-        self._mod_list.grid(row=2, column=0, sticky="nsew", padx=6)
-        self._mod_list.grid_columnconfigure(0, weight=1)
-        # Bind scroll wheel to the frame itself (catches events on empty area)
-        self._bind_scroll(self._mod_list, self._mod_list)
+        self._vlist_canvas.grid(row=0, column=0, sticky="nsew")
+
+        _vscroll = ctk.CTkScrollbar(list_outer, command=self._vlist_yview)
+        _vscroll.grid(row=0, column=1, sticky="ns")
+        self._vlist_canvas.configure(yscrollcommand=_vscroll.set)
+
+        self._vlist_canvas.bind("<Configure>",  self._vlist_on_configure)
+        self._vlist_canvas.bind("<Button-4>",   lambda _: self._vlist_scroll(-1))
+        self._vlist_canvas.bind("<Button-5>",   lambda _: self._vlist_scroll(1))
 
         btns = ctk.CTkFrame(sb, fg_color="transparent")
         btns.grid(row=3, column=0, sticky="ew", padx=12, pady=12)
@@ -534,7 +610,6 @@ class App(ctk.CTk):
                              corner_radius=0)
         outer.grid(row=0, column=0, sticky="nsew")
         outer.grid_columnconfigure(0, weight=1)
-        outer.grid_rowconfigure(1, weight=1)
 
         hdr = ctk.CTkFrame(outer, fg_color="transparent")
         hdr.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 0))
@@ -563,15 +638,62 @@ class App(ctk.CTk):
         # Shown only when a Nexus ID is known
         self._nexus_id: str | None = None
 
-        # Scrollable content area
+        # Tab bar: two full-width buttons
+        # Active tab matches panel bg; inactive is slightly darker
+        _BG       = ("gray91", "gray14")   # matches outer fg_color
+        _INACTIVE = ("gray80", "gray22")
+        _HOVER    = ("gray85", "gray18")
+
+        tab_bar = ctk.CTkFrame(outer, fg_color=_INACTIVE, corner_radius=0, height=30)
+        tab_bar.grid(row=1, column=0, sticky="ew")
+        tab_bar.grid_columnconfigure((0, 1), weight=1)
+        tab_bar.grid_propagate(False)
+
+        self._tab_info_btn = ctk.CTkButton(
+            tab_bar, text="Info", corner_radius=0, height=30,
+            fg_color=_BG, hover_color=_HOVER,
+            font=ctk.CTkFont(size=12),
+            command=lambda: self._switch_info_tab("info"),
+        )
+        self._tab_info_btn.grid(row=0, column=0, sticky="nsew")
+
+        self._tab_assets_btn = ctk.CTkButton(
+            tab_bar, text="Assets", corner_radius=0, height=30,
+            fg_color=_INACTIVE, hover_color=_HOVER,
+            font=ctk.CTkFont(size=12),
+            command=lambda: self._switch_info_tab("assets"),
+        )
+        self._tab_assets_btn.grid(row=0, column=1, sticky="nsew")
+
+        # Content container — both scrollable frames stacked here; only one shown
+        content = ctk.CTkFrame(outer, fg_color=_BG, corner_radius=0)
+        content.grid(row=2, column=0, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(0, weight=1)
+        outer.grid_rowconfigure(2, weight=1)
+        outer.grid_rowconfigure(1, weight=0)
+
         self._info_scroll = ctk.CTkScrollableFrame(
-            outer, fg_color="transparent",
+            content, fg_color="transparent",
             scrollbar_button_color=("gray70", "gray30"),
             scrollbar_button_hover_color=("gray60", "gray40"),
         )
-        self._info_scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=(6, 4))
+        self._info_scroll.grid(row=0, column=0, sticky="nsew")
         self._info_scroll.grid_columnconfigure(0, weight=1)
         self._bind_scroll(self._info_scroll, self._info_scroll)
+
+        self._assets_scroll = ctk.CTkScrollableFrame(
+            content, fg_color="transparent",
+            scrollbar_button_color=("gray70", "gray30"),
+            scrollbar_button_hover_color=("gray60", "gray40"),
+        )
+        self._assets_scroll.grid(row=0, column=0, sticky="nsew")
+        self._assets_scroll.grid_columnconfigure(0, weight=1)
+        self._bind_scroll(self._assets_scroll, self._assets_scroll)
+        self._assets_scroll.grid_remove()  # Info tab is default
+
+        self._active_info_tab  = "info"
+        self._assets_mod_dir: "Path | None" = None
 
         # Initial placeholder
         self._show_info_placeholder("← Select a mod to view details")
@@ -587,6 +709,87 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=13),
             text_color=("gray55", "gray50"),
         ).grid(row=0, column=0, pady=40)
+
+    def _switch_info_tab(self, tab: str):
+        _BG       = ("gray91", "gray14")
+        _INACTIVE = ("gray80", "gray22")
+        self._active_info_tab = tab
+        if tab == "info":
+            self._tab_info_btn.configure(fg_color=_BG)
+            self._tab_assets_btn.configure(fg_color=_INACTIVE)
+            self._assets_scroll.grid_remove()
+            self._info_scroll.grid()
+        else:
+            self._tab_assets_btn.configure(fg_color=_BG)
+            self._tab_info_btn.configure(fg_color=_INACTIVE)
+            self._info_scroll.grid_remove()
+            self._assets_scroll.grid()
+            mod_dir = self._folder_path
+            if mod_dir and mod_dir != self._assets_mod_dir:
+                self._assets_mod_dir = mod_dir
+                self._load_assets_tab(mod_dir)
+
+    def _load_assets_tab(self, mod_dir: Path):
+        for w in self._assets_scroll.winfo_children():
+            w.destroy()
+
+        # Serve from cache immediately if available
+        if mod_dir in self._assets_cache:
+            self._show_assets(self._assets_cache[mod_dir])
+            return
+
+        ctk.CTkLabel(self._assets_scroll, text="Scanning…",
+                     font=ctk.CTkFont(size=12),
+                     text_color=("gray55", "gray50"),
+                     ).grid(row=0, column=0, pady=30)
+
+        def worker():
+            assets = []
+            try:
+                for utoc in sorted(mod_dir.rglob("*.utoc")):
+                    assets.extend(_utoc_assets(utoc))
+            except Exception:
+                pass
+            self._assets_cache[mod_dir] = assets
+            self.after(0, lambda: self._show_assets(assets))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_assets(self, assets: list):
+        for w in self._assets_scroll.winfo_children():
+            w.destroy()
+        if not assets:
+            ctk.CTkLabel(self._assets_scroll,
+                         text="No .utoc asset data found for this mod.",
+                         font=ctk.CTkFont(size=12),
+                         text_color=("gray55", "gray50"),
+                         ).grid(row=0, column=0, pady=30)
+            return
+
+        # Group by directory prefix
+        grouped: dict[str, list[str]] = {}
+        for a in assets:
+            parts = a.rsplit("/", 1)
+            directory = parts[0] if len(parts) == 2 else ""
+            filename  = parts[-1]
+            grouped.setdefault(directory, []).append(filename)
+
+        row = 0
+        for directory in sorted(grouped):
+            files = sorted(grouped[directory])
+            ctk.CTkLabel(self._assets_scroll,
+                         text=directory or "/",
+                         font=ctk.CTkFont(size=10, weight="bold"),
+                         text_color=("gray45", "gray55"), anchor="w",
+                         ).grid(row=row, column=0, sticky="w", padx=8, pady=(8, 1))
+            row += 1
+            for fname in files:
+                ctk.CTkLabel(self._assets_scroll,
+                             text=f"  {fname}",
+                             font=ctk.CTkFont(family="monospace", size=11),
+                             text_color=("gray30", "gray72"), anchor="w",
+                             ).grid(row=row, column=0, sticky="w", padx=8)
+                row += 1
 
     def _show_archive_info(self, name: str, arch_path: Path):
         """Info panel content for an archive that hasn't been extracted yet."""
@@ -670,11 +873,7 @@ class App(ctk.CTk):
                      ).grid(row=2, column=0, sticky="w", padx=16, pady=(0, 8))
 
         # Augment with Nexus data if available
-        api_key = ""
-        try:
-            api_key = _load_config().get("nexus_api_key", "")
-        except Exception:
-            pass
+        api_key = self._cfg.get("nexus_api_key", "")
         if nid:
             nd = self._nexus_cache.get(nid)
             if nd and not nd.get("_error"):
@@ -703,6 +902,10 @@ class App(ctk.CTk):
         self._folder_btn.grid_remove()
         self._nexus_btn.grid_remove()
         self._info_img_ref = None
+        # Reset assets tab so it reloads for the new mod
+        self._assets_mod_dir = None
+        for w in self._assets_scroll.winfo_children():
+            w.destroy()
 
         if name is None:
             self._show_info_placeholder("← Click a mod to view details")
@@ -716,13 +919,11 @@ class App(ctk.CTk):
 
         mod_dir = None
         try:
-            cfg = _load_config()
-            mod_dir = cfg["mods_dir"] / name
+            mod_dir = self._cfg["mods_dir"] / name
         except Exception:
             pass
 
-        state   = _load_state()
-        ms      = state["mods"].get(name, {})
+        ms      = self._state["mods"].get(name, {})
         is_on   = ms.get("enabled", False)
         links   = len(ms.get("symlinks", []))
         exists  = mod_dir and mod_dir.is_dir()
@@ -733,17 +934,18 @@ class App(ctk.CTk):
             self._folder_path = mod_dir
             self._folder_btn.grid(row=0, column=1, sticky="e", padx=(0, 6))
 
-        try:
-            info = _read_mod_info(mod_dir) if exists else {}
-        except Exception:
+        if exists:
+            if mod_dir not in self._mod_info_cache:
+                try:
+                    self._mod_info_cache[mod_dir] = _read_mod_info(mod_dir)
+                except Exception:
+                    self._mod_info_cache[mod_dir] = {}
+            info = self._mod_info_cache[mod_dir].copy()
+        else:
             info = {}
 
         # ── Augment with cached Nexus data ────────────────────────────
-        api_key = ""
-        try:
-            api_key = _load_config().get("nexus_api_key", "")
-        except Exception:
-            pass
+        api_key = self._cfg.get("nexus_api_key", "")
 
         if nid:
             nd = self._nexus_cache.get(nid)
@@ -893,15 +1095,25 @@ class App(ctk.CTk):
                          justify="left", wraplength=560,
                          ).grid(row=3, column=0, sticky="w", padx=12, pady=(2, 0))
 
-        # ── Pak files ─────────────────────────────────────────────────
-        stems = info.get("pak_stems", [])
+        # ── Contents ──────────────────────────────────────────────────
+        stems      = info.get("pak_stems", [])
+        ue4ss_mods = info.get("ue4ss_mods", [])
+        scripts    = info.get("script_files", [])
+
+        items: list[str] = []
         if stems:
+            items = stems
+            heading = f"Contents  ({len(stems)} pak file(s))"
+        elif ue4ss_mods:
+            items = ue4ss_mods + scripts
+            heading = f"Contents  (UE4SS — {', '.join(ue4ss_mods)})"
+
+        if items:
             sep2 = ctk.CTkFrame(self._info_scroll, height=1,
                                 fg_color=("gray75", "gray28"))
             sep2.grid(row=4, column=0, sticky="ew", padx=8, pady=(10, 6))
 
-            ctk.CTkLabel(self._info_scroll,
-                         text=f"Contents  ({len(stems)} pak file(s))",
+            ctk.CTkLabel(self._info_scroll, text=heading,
                          font=ctk.CTkFont(size=11, weight="bold"),
                          text_color=("gray45", "gray55"), anchor="w",
                          ).grid(row=5, column=0, sticky="w", padx=12)
@@ -910,17 +1122,23 @@ class App(ctk.CTk):
             files_frame.grid(row=6, column=0, sticky="ew", padx=12, pady=(2, 8))
 
             limit = 12
-            for i, stem in enumerate(stems[:limit]):
-                ctk.CTkLabel(files_frame, text=f"  {stem}",
+            display = items if stems else scripts  # for UE4SS, list scripts under the mod name
+            for i, name in enumerate(display[:limit]):
+                ctk.CTkLabel(files_frame, text=f"  {name}",
                              font=ctk.CTkFont(family="monospace", size=11),
                              text_color=("gray35", "gray70"), anchor="w",
                              ).grid(row=i, column=0, sticky="w")
-            if len(stems) > limit:
+            if len(display) > limit:
                 ctk.CTkLabel(files_frame,
-                             text=f"  … and {len(stems) - limit} more",
+                             text=f"  … and {len(display) - limit} more",
                              font=ctk.CTkFont(size=11),
                              text_color=("gray55", "gray50"), anchor="w",
                              ).grid(row=limit, column=0, sticky="w")
+
+        # If assets tab is already visible, load assets for the new mod now
+        if self._active_info_tab == "assets" and self._folder_path:
+            self._assets_mod_dir = self._folder_path
+            self._load_assets_tab(self._folder_path)
 
     # ── Nexus API background fetch ────────────────────────────────────
 
@@ -980,7 +1198,8 @@ class App(ctk.CTk):
             for mod_name, lbl in list(self._name_labels.items()):
                 if _nexus_id(mod_name) == nid:
                     try:
-                        lbl.configure(text=nexus_name)
+                        if lbl.winfo_exists():
+                            lbl.configure(text=nexus_name)
                     except Exception:
                         pass
             # Re-sort if a new mod name just arrived (only uncached mods reach here)
@@ -1432,6 +1651,10 @@ class App(ctk.CTk):
         except Exception as e:
             self._log_write(f"[error] Could not load config/state: {e}\n")
             return
+        self._cfg   = cfg
+        self._state = state
+        self._mod_info_cache.clear()
+        self._assets_cache.clear()
 
         mods_dir = cfg["mods_dir"]
         self._on_disk = (
@@ -1471,156 +1694,56 @@ class App(ctk.CTk):
                 self._focused not in self._archived:
             self._focused = None
 
-        for w in self._mod_list.winfo_children():
-            w.destroy()
+        # Destroy all currently-rendered virtual cards
+        for w_data in self._vlist_widgets.values():
+            try:
+                w_data["frame"].destroy()
+            except Exception:
+                pass
+        self._vlist_widgets.clear()
         self._switches.clear()
         self._cards.clear()
         self._checkboxvars.clear()
         self._name_labels.clear()
 
+        # Build the virtual items list
+        items: list  = []
+        yoffs: list  = []
+        y = 0
         enabled = 0
-        for i, name in enumerate(all_mods):
+        for name in all_mods:
             ms       = state["mods"].get(name, {})
             is_on    = ms.get("enabled", False)
-            symlinks = len(ms.get("symlinks", []))
-            exists   = name in self._on_disk
-            disp     = self._get_disp_name(name)
-            checked  = name in self._selected
-            focused  = name == self._focused
             if is_on:
                 enabled += 1
+            items.append({
+                "type":     "mod",
+                "name":     name,
+                "disp":     self._get_disp_name(name),
+                "is_on":    is_on,
+                "symlinks": len(ms.get("symlinks", [])),
+                "exists":   name in self._on_disk,
+            })
+            yoffs.append(y)
+            y += _CARD_H + _V_PAD
 
-            if checked:
-                bg, bw = _CARD_CHECKED, 2
-            elif focused:
-                bg, bw = _CARD_FOCUSED, 1
-            else:
-                bg, bw = _CARD_NORMAL, 0
-
-            card = ctk.CTkFrame(
-                self._mod_list,
-                fg_color=bg, corner_radius=7,
-                border_width=bw, border_color="#2980b9",
-            )
-            card.grid(row=i, column=0, sticky="ew", pady=2, padx=2)
-            card.grid_columnconfigure(2, weight=1)
-            self._cards[name] = card
-
-            # Checkbox for batch selection (col 0)
-            cb_var = ctk.BooleanVar(value=checked)
-            self._checkboxvars[name] = cb_var
-            cb = ctk.CTkCheckBox(
-                card, text="", variable=cb_var,
-                width=20, checkbox_width=15, checkbox_height=15,
-                command=lambda n=name, v=cb_var: self._on_checkbox_change(n, v),
-            )
-            cb.grid(row=0, column=0, padx=(8, 2), pady=8)
-            if not exists:
-                cb.configure(state="disabled")
-
-            dot_col = "#27ae60" if is_on else ("gray52", "gray40")
-            dot_lbl = ctk.CTkLabel(card, text="●", font=ctk.CTkFont(size=13),
-                                   text_color=dot_col, width=22)
-            dot_lbl.grid(row=0, column=1, padx=(2, 4), pady=8)
-
-            name_col = ("gray10", "gray90") if exists else ("gray52", "gray46")
-            name_lbl = ctk.CTkLabel(card, text=disp,
-                                    font=ctk.CTkFont(size=12),
-                                    text_color=name_col, anchor="w")
-            name_lbl.grid(row=0, column=2, sticky="w", padx=4)
-            self._name_labels[name] = name_lbl
-
-            badge = None
-            if is_on and symlinks:
-                badge = ctk.CTkLabel(
-                    card, text=str(symlinks),
-                    font=ctk.CTkFont(size=10),
-                    text_color=("gray50", "gray48"),
-                    fg_color=("gray70", "gray30"),
-                    corner_radius=4, width=28, height=18,
-                )
-                badge.grid(row=0, column=3, padx=6)
-
-            var = ctk.BooleanVar(value=is_on)
-            sw  = ctk.CTkSwitch(
-                card, text="", variable=var, width=46,
-                onvalue=True, offvalue=False,
-                command=lambda n=name, v=var: self._toggle(n, v),
-            )
-            sw.grid(row=0, column=4, padx=(4, 10), pady=8)
-            if not exists:
-                sw.configure(state="disabled")
-
-            self._switches[name] = (var, sw)
-
-            # Card body click → show info (focus), no batch-select change
-            if exists:
-                for widget in (card, dot_lbl, name_lbl) + ((badge,) if badge else ()):
-                    widget.bind("<Button-1>",
-                                lambda _, n=name: self._set_focus(n))
-                card.configure(cursor="hand2")
-
-            self._bind_scroll(card, self._mod_list)
-
-        # ── Archive-only entries ───────────────────────────────────────
-        base_row = len(all_mods)
         if self._archived:
-            sep_lbl = ctk.CTkLabel(
-                self._mod_list,
-                text="AVAILABLE ARCHIVES",
-                font=ctk.CTkFont(size=10, weight="bold"),
-                text_color=("gray50", "gray50"),
-                anchor="w",
-            )
-            sep_lbl.grid(row=base_row, column=0, sticky="ew",
-                         padx=10, pady=(10, 2))
-            self._bind_scroll(sep_lbl, self._mod_list)
-            base_row += 1
+            items.append({"type": "sep", "name": "AVAILABLE ARCHIVES"})
+            yoffs.append(y)
+            y += _SEP_H + _V_PAD
+            for stem in sorted(self._archived.keys()):
+                items.append({
+                    "type": "archive",
+                    "name": stem,
+                    "disp": _display_name(stem),
+                })
+                yoffs.append(y)
+                y += _CARD_H + _V_PAD
 
-        for j, (stem, _) in enumerate(sorted(self._archived.items())):
-            disp    = _display_name(stem)
-            focused = stem == self._focused
-            bg, bw  = (_CARD_FOCUSED, 1) if focused else (_CARD_NORMAL, 0)
-
-            card = ctk.CTkFrame(
-                self._mod_list,
-                fg_color=bg, corner_radius=7,
-                border_width=bw, border_color="#2980b9",
-            )
-            card.grid(row=base_row + j, column=0, sticky="ew", pady=2, padx=2)
-            card.grid_columnconfigure(2, weight=1)
-            self._cards[stem] = card
-
-            # Placeholder checkbox space (no checkbox for archives)
-            ctk.CTkLabel(card, text="", width=20).grid(
-                row=0, column=0, padx=(8, 2))
-
-            dot_lbl = ctk.CTkLabel(card, text="●", font=ctk.CTkFont(size=13),
-                                   text_color="#e67e22", width=22)
-            dot_lbl.grid(row=0, column=1, padx=(2, 4), pady=8)
-
-            name_lbl = ctk.CTkLabel(card, text=disp,
-                                    font=ctk.CTkFont(size=12),
-                                    text_color=("gray10", "gray90"), anchor="w")
-            name_lbl.grid(row=0, column=2, sticky="w", padx=4)
-
-            badge = ctk.CTkLabel(
-                card, text="archive",
-                font=ctk.CTkFont(size=10),
-                text_color=("#7a4a10", "#e09050"),
-                fg_color=("#f5dfc0", "#3a2a10"),
-                corner_radius=4, width=50, height=18,
-            )
-            badge.grid(row=0, column=3, padx=6)
-
-            # No switch — just a spacer to keep layout consistent
-            ctk.CTkLabel(card, text="", width=56).grid(row=0, column=4)
-
-            for widget in (card, dot_lbl, name_lbl, badge):
-                widget.bind("<Button-1>", lambda _, n=stem: self._set_focus(n))
-            card.configure(cursor="hand2")
-
-            self._bind_scroll(card, self._mod_list)
+        self._vlist_items   = items
+        self._vlist_yoffs   = yoffs
+        self._vlist_total_h = y
+        self._vlist_canvas.configure(scrollregion=(0, 0, 0, max(y, 1)))
 
         self._count_label.configure(text=f"{enabled}/{len(all_mods)}")
         self._status.configure(
@@ -1645,9 +1768,247 @@ class App(ctk.CTk):
                         daemon=True,
                     ).start()
 
+        # Render visible cards (deferred slightly so canvas has its final size)
+        self.after(10, self._vlist_render)
+
         self._update_info_panel(self._focused)
 
-    # ── Scroll helper ─────────────────────────────────────────────────
+    # ── Virtual list helpers ───────────────────────────────────────────
+
+    def _vlist_yview(self, *args):
+        """Scrollbar command: move canvas immediately, debounce card creation."""
+        self._vlist_canvas.yview(*args)
+        # Debounce: rapid scrollbar drags fire hundreds of events; don't create
+        # widgets on every pixel — wait until the user stops dragging.
+        if self._vlist_render_after is not None:
+            self.after_cancel(self._vlist_render_after)
+        self._vlist_render_after = self.after(120, self._vlist_render_deferred)
+
+    def _vlist_render_deferred(self):
+        self._vlist_render_after = None
+        self._vlist_render()
+
+    def _vlist_scroll(self, direction: int):
+        """Mouse-wheel scroll: one step at a time, render immediately."""
+        self._vlist_canvas.yview_scroll(direction, "units")
+        self._vlist_render()
+
+    def _vlist_on_configure(self, event=None):
+        """Canvas resized: update card widths and re-render."""
+        if event and event.width > 10:
+            new_w = event.width - 4
+            for w_data in self._vlist_widgets.values():
+                self._vlist_canvas.itemconfigure(w_data["cid"], width=new_w)
+        self._vlist_render()
+
+    def _vlist_render(self):
+        """Create card widgets only for rows visible in the canvas viewport."""
+        canvas   = self._vlist_canvas
+        canvas_h = canvas.winfo_height()
+        canvas_w = canvas.winfo_width()
+        if canvas_h < 10 or canvas_w < 10 or not self._vlist_items:
+            return
+
+        y_top    = canvas.canvasy(0)
+        y_bot    = canvas.canvasy(canvas_h)
+        buf_px   = _V_BUF * (_CARD_H + _V_PAD)
+        vis_top  = y_top - buf_px
+        vis_bot  = y_bot + buf_px
+
+        visible: set = set()
+        for i, yo in enumerate(self._vlist_yoffs):
+            h = _SEP_H if self._vlist_items[i]["type"] == "sep" else _CARD_H
+            if yo + h > vis_top and yo < vis_bot:
+                visible.add(i)
+
+        # Destroy off-screen widgets
+        to_remove = [i for i in list(self._vlist_widgets) if i not in visible]
+        for i in to_remove:
+            w_data = self._vlist_widgets.pop(i)
+            name   = self._vlist_items[i].get("name", "")
+            try:
+                w_data["frame"].destroy()
+            except Exception:
+                pass
+            self._cards.pop(name, None)
+            self._switches.pop(name, None)
+            self._checkboxvars.pop(name, None)
+            self._name_labels.pop(name, None)
+
+        # Create newly visible widgets
+        card_w = max(canvas_w - 4, 10)
+        for i in visible:
+            if i in self._vlist_widgets:
+                continue
+            item  = self._vlist_items[i]
+            yo    = self._vlist_yoffs[i]
+            frame = self._vlist_create_card(item)
+            cid   = canvas.create_window(2, yo, window=frame,
+                                         anchor="nw", width=card_w)
+            self._vlist_widgets[i] = {"frame": frame, "cid": cid}
+            if item["type"] in ("mod", "archive"):
+                self._cards[item["name"]] = frame
+
+    def _vlist_create_card(self, item: dict) -> ctk.CTkFrame:
+        """Build and return a single card (or separator) frame for the canvas."""
+        itype = item["type"]
+        name  = item["name"]
+
+        # ── Separator row ────────────────────────────────────────────
+        if itype == "sep":
+            f = ctk.CTkFrame(self._vlist_canvas, fg_color="transparent",
+                             height=_SEP_H)
+            ctk.CTkLabel(
+                f, text=name,
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color=("gray50", "gray50"), anchor="w",
+            ).place(x=10, y=8)
+            self._bind_canvas_scroll(f)
+            return f
+
+        # ── Mod / archive card ───────────────────────────────────────
+        if itype == "mod":
+            is_on    = item["is_on"]
+            symlinks = item["symlinks"]
+            exists   = item["exists"]
+            disp     = item["disp"]
+            checked  = name in self._selected
+            focused  = name == self._focused
+        else:  # archive
+            is_on    = False
+            symlinks = 0
+            exists   = False
+            disp     = item["disp"]
+            checked  = False
+            focused  = name == self._focused
+
+        if checked:
+            bg, bw = _CARD_CHECKED, 2
+        elif focused:
+            bg, bw = _CARD_FOCUSED, 1
+        else:
+            bg, bw = _CARD_NORMAL, 0
+
+        card = ctk.CTkFrame(
+            self._vlist_canvas, fg_color=bg, corner_radius=7,
+            border_width=bw, border_color="#2980b9",
+        )
+        card.grid_columnconfigure(2, weight=1)
+
+        # col 0 – checkbox (mod) or spacer (archive)
+        if itype == "mod":
+            cb_var = ctk.BooleanVar(value=checked)
+            self._checkboxvars[name] = cb_var
+            cb = ctk.CTkCheckBox(
+                card, text="", variable=cb_var,
+                width=20, checkbox_width=15, checkbox_height=15,
+                command=lambda n=name, v=cb_var: self._on_checkbox_change(n, v),
+            )
+            cb.grid(row=0, column=0, padx=(8, 2), pady=8)
+            if not exists:
+                cb.configure(state="disabled")
+        else:
+            ctk.CTkLabel(card, text="", width=20).grid(
+                row=0, column=0, padx=(8, 2))
+
+        # col 1 – status dot
+        if itype == "archive":
+            dot_col = "#e67e22"
+        elif is_on:
+            dot_col = "#27ae60"
+        else:
+            dot_col = ("gray52", "gray40")
+        dot_lbl = ctk.CTkLabel(card, text="●", font=ctk.CTkFont(size=13),
+                               text_color=dot_col, width=22)
+        dot_lbl.grid(row=0, column=1, padx=(2, 4), pady=8)
+
+        # col 2 – mod name
+        name_col = ("gray52", "gray46") if (itype == "mod" and not exists) \
+                   else ("gray10", "gray90")
+        name_lbl = ctk.CTkLabel(card, text=disp, font=ctk.CTkFont(size=12),
+                                text_color=name_col, anchor="w")
+        name_lbl.grid(row=0, column=2, sticky="w", padx=4)
+        self._name_labels[name] = name_lbl
+
+        # col 3 – badge
+        badge = None
+        if itype == "mod" and is_on and symlinks:
+            badge = ctk.CTkLabel(
+                card, text=str(symlinks),
+                font=ctk.CTkFont(size=10),
+                text_color=("gray50", "gray48"),
+                fg_color=("gray70", "gray30"),
+                corner_radius=4, width=28, height=18,
+            )
+            badge.grid(row=0, column=3, padx=6)
+        elif itype == "archive":
+            badge = ctk.CTkLabel(
+                card, text="archive",
+                font=ctk.CTkFont(size=10),
+                text_color=("#7a4a10", "#e09050"),
+                fg_color=("#f5dfc0", "#3a2a10"),
+                corner_radius=4, width=50, height=18,
+            )
+            badge.grid(row=0, column=3, padx=6)
+        else:
+            ctk.CTkLabel(card, text="", width=28).grid(row=0, column=3)
+
+        # col 4 – switch (mod) or spacer (archive)
+        if itype == "mod":
+            var = ctk.BooleanVar(value=is_on)
+            sw  = ctk.CTkSwitch(
+                card, text="", variable=var, width=46,
+                onvalue=True, offvalue=False,
+                command=lambda n=name, v=var: self._toggle(n, v),
+            )
+            sw.grid(row=0, column=4, padx=(4, 10), pady=8)
+            if not exists:
+                sw.configure(state="disabled")
+            self._switches[name] = (var, sw)
+        else:
+            ctk.CTkLabel(card, text="", width=56).grid(row=0, column=4)
+
+        # Click-to-focus bindings
+        if (itype == "mod" and exists) or itype == "archive":
+            click_widgets = [card, dot_lbl, name_lbl] + ([badge] if badge else [])
+            for w in click_widgets:
+                w.bind("<Button-1>", lambda _, n=name: self._set_focus(n))
+            card.configure(cursor="hand2")
+
+        self._bind_canvas_scroll(card)
+        return card
+
+    def _bind_canvas_scroll(self, widget):
+        """Recursively bind Linux scroll events on widget to scroll the virtual list."""
+        widget.bind("<Button-4>", lambda _: self._vlist_scroll(-1), add="+")
+        widget.bind("<Button-5>", lambda _: self._vlist_scroll(1),  add="+")
+        for child in widget.winfo_children():
+            self._bind_canvas_scroll(child)
+
+    def _scroll_into_view(self, name: str):
+        """Scroll the virtual list so the item for 'name' is fully visible."""
+        try:
+            idx = next(i for i, it in enumerate(self._vlist_items)
+                       if it.get("name") == name)
+        except StopIteration:
+            return
+        yo       = self._vlist_yoffs[idx]
+        h        = _SEP_H if self._vlist_items[idx]["type"] == "sep" else _CARD_H
+        canvas   = self._vlist_canvas
+        canvas_h = canvas.winfo_height()
+        total_h  = self._vlist_total_h
+        if canvas_h <= 0 or total_h <= canvas_h:
+            return
+        y_top = canvas.canvasy(0)
+        y_bot = canvas.canvasy(canvas_h)
+        if yo < y_top:
+            canvas.yview_moveto(yo / total_h)
+            self._vlist_render()
+        elif yo + h > y_bot:
+            canvas.yview_moveto(max(0.0, (yo + h - canvas_h) / total_h))
+            self._vlist_render()
+
+    # ── Scroll helper (info panel) ─────────────────────────────────────
 
     def _bind_scroll(self, widget, scroll_frame):
         """Recursively bind Linux scroll events on widget to scroll scroll_frame."""
@@ -1672,7 +2033,9 @@ class App(ctk.CTk):
                 idx = max(0, idx - 1)
             else:
                 idx = min(len(self._all_mods) - 1, idx + 1)
-        self._set_focus(self._all_mods[idx])
+        target = self._all_mods[idx]
+        self._set_focus(target)
+        self._scroll_into_view(target)
 
     # ── Selection ─────────────────────────────────────────────────────
 
@@ -1706,7 +2069,8 @@ class App(ctk.CTk):
 
     def _repaint_card(self, name: str):
         card = self._cards.get(name)
-        if not card:
+        if not card or not card.winfo_exists():
+            self._cards.pop(name, None)
             return
         checked = name in self._selected
         focused = self._focused == name
