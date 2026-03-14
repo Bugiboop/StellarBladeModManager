@@ -13,8 +13,8 @@ IGNORED_FILENAMES = {"modinfo.ini", "1.png", "mods.txt"}          # overwritten 
 
 
 def load_profile(game_id: str) -> dict:
-    """Load a game profile JSON from game_profiles/<game_id>.json."""
-    path = PROFILES_DIR / f"{game_id}.json"
+    """Load a game profile JSON from game_profiles/<game_id>/<game_id>.json."""
+    path = PROFILES_DIR / game_id / f"{game_id}.json"
     if not path.exists():
         print(f"[warn] Game profile not found: {path}  —  using empty profile")
         return {}
@@ -68,11 +68,17 @@ def load_config() -> dict:
         print(f"[error] No game_root configured for game '{current_game}'.")
         sys.exit(1)
 
-    # Per-game data directory (stellar_blade keeps root for backward compat)
-    data_dir = SCRIPT_DIR if current_game == "stellar_blade" \
-               else SCRIPT_DIR / "games" / current_game
+    # Per-game data directory: game_profiles/<game_id>/
+    data_dir = PROFILES_DIR / current_game
     data_dir.mkdir(parents=True, exist_ok=True)
-    STATE_FILE = data_dir / "state.json"
+
+    # Migrate root-level state.json (old layout) into the game's data dir
+    old_state = SCRIPT_DIR / "state.json"
+    new_state  = data_dir / "state.json"
+    if old_state.exists() and not new_state.exists():
+        old_state.rename(new_state)
+
+    STATE_FILE = new_state
 
     profile = load_profile(current_game)
     if profile.get("pak_extensions"):

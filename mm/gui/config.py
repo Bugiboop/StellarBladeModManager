@@ -14,8 +14,8 @@ _UA              = "ModManager/1.0"
 
 
 def _load_profile(game_id: str) -> dict:
-    """Load game_profiles/<game_id>.json; returns {} if not found."""
-    p = _PROFILES_DIR / f"{game_id}.json"
+    """Load game_profiles/<game_id>/<game_id>.json; returns {} if not found."""
+    p = _PROFILES_DIR / game_id / f"{game_id}.json"
     if p.exists():
         with open(p) as f:
             return json.load(f)
@@ -23,10 +23,14 @@ def _load_profile(game_id: str) -> dict:
 
 
 def _available_profile_ids() -> list:
-    """Return profile IDs for all *.json files in game_profiles/."""
+    """Return profile IDs for all game_profiles/<id>/<id>.json subdirectories."""
     if not _PROFILES_DIR.exists():
         return []
-    return [p.stem for p in sorted(_PROFILES_DIR.glob("*.json"))]
+    ids = []
+    for d in sorted(_PROFILES_DIR.iterdir()):
+        if d.is_dir() and (d / f"{d.name}.json").exists():
+            ids.append(d.name)
+    return ids
 
 
 def _load_config() -> dict:
@@ -46,12 +50,17 @@ def _load_config() -> dict:
     current_game = raw.get("current_game", "stellar_blade")
     game_cfg     = raw.get("games", {}).get(current_game, {})
 
-    # Per-game data dir (stellar_blade uses root for backward compat)
-    data_dir = SCRIPT_DIR if current_game == "stellar_blade" \
-               else SCRIPT_DIR / "games" / current_game
+    # Per-game data directory: game_profiles/<game_id>/
+    data_dir = _PROFILES_DIR / current_game
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    _STATE_FILE      = data_dir / "state.json"
+    # Migrate root-level state.json (old layout) into the game's data dir
+    old_state = SCRIPT_DIR / "state.json"
+    new_state  = data_dir / "state.json"
+    if old_state.exists() and not new_state.exists():
+        old_state.rename(new_state)
+
+    _STATE_FILE      = new_state
     _NEXUS_CACHE_DIR = data_dir / ".nexus_cache"
 
     # Update Nexus / UA from profile

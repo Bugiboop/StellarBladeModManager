@@ -15,9 +15,9 @@ Your game directory is never directly overwritten. Every mod file is installed a
 
 ## Features
 
-- **GUI and CLI** — a clean dark-themed desktop app (`sbmm_gui.py`) alongside the full-featured command-line tool (`sbmm.py`)
+- **GUI and CLI** — a clean dark-themed desktop app (`sbmm_gui.py`) and a full-featured command-line interface (`sbmm.py`), both backed by the `mm/` package
 - **Multi-game support** — switch between games from the sidebar; each game gets its own state, mod folder, and Nexus cache
-- **Game profiles** — all game-specific routing rules, extensions, and Nexus settings live in `game_profiles/<id>.json`; add a new game by dropping in a JSON file
+- **Game profiles** — all game-specific routing rules, extensions, and Nexus settings live in `game_profiles/<id>/<id>.json`; add a new game by creating a subdirectory with a matching JSON file
 - **Nexus Mods integration** — fetches mod names, descriptions, authors, and cover art automatically using your Nexus API key; results are cached locally per game
 - **Automatic mod structure detection** — handles all common Nexus Mods layouts, UE4SS mods, CNS `.json` configs, flat pak drops, and full game-tree paths
 - **Variant selection** — detects mods with multiple version folders (e.g. `Green/`, `Blue/`) and shows a GUI dialog to pick one at extract or enable time
@@ -55,7 +55,7 @@ python3 -m venv .venv
 .venv/bin/pip install customtkinter Pillow
 ```
 
-On first launch, `config.json` is auto-created. You can also create it manually:
+Create `config.json` in the project root before first launch:
 
 ```json
 {
@@ -94,7 +94,7 @@ On first launch, `config.json` is auto-created. You can also create it manually:
 ### CLI
 
 ```bash
-# Drop archives into compressed/, then:
+# Drop archives into game_profiles/<game_id>/compressed/, then:
 python sbmm.py --install          # extract + enable everything
 python sbmm.py --extract          # extract only (choose variants interactively)
 
@@ -118,7 +118,13 @@ python sbmm.py --uninstall        # remove all symlinks, restore backups
 
 ### 1. Create the profile
 
-Drop a file into `game_profiles/<game_id>.json`. The `game_id` must be a lowercase, underscore-separated identifier (e.g. `black_myth_wukong`).
+Create a directory `game_profiles/<game_id>/` and drop a file named `<game_id>.json` inside it. The `game_id` must be a lowercase, underscore-separated identifier (e.g. `black_myth_wukong`).
+
+```
+game_profiles/
+└── black_myth_wukong/
+    └── black_myth_wukong.json
+```
 
 ```json
 {
@@ -168,7 +174,7 @@ Or add it manually to `config.json`:
 
 | Field | Type | Description |
 |---|---|---|
-| `id` | string | Must match the filename (without `.json`) |
+| `id` | string | Must match both the subdirectory name and the filename (without `.json`) |
 | `name` | string | Display name shown in the GUI |
 | `nexus_slug` | string | Game identifier on Nexus Mods (from the URL) |
 | `pak_extensions` | array | File extensions treated as mod files |
@@ -225,25 +231,23 @@ The Nexus game is determined by the `nexus_slug` in the active game profile. API
 
 ```
 ModManager/
-├── sbmm.py               # CLI mod manager (backend)
-├── sbmm_gui.py           # GUI frontend
+├── sbmm.py               # CLI entry point
+├── sbmm_gui.py           # GUI entry point
 ├── config.json           # your configuration (edit or use Settings / + button)
-├── state.json            # auto-managed — Stellar Blade symlinks, backups, choices
-├── game_profiles/        # game profile definitions
-│   └── stellar_blade.json
-├── games/                # per-game data for non-Stellar-Blade games
-│   └── <game_id>/
-│       ├── state.json
-│       ├── .nexus_cache/
-│       ├── mods/
-│       └── compressed/
-├── .venv/                # Python virtual environment (GUI dependencies)
-├── .nexus_cache/         # Stellar Blade Nexus cache (root for backward compat)
-├── compressed/           # Stellar Blade archives (root for backward compat)
-└── mods/                 # Stellar Blade mod folders (root for backward compat)
+├── mm/                   # backend + GUI packages
+│   ├── commands.py  config.py  archive.py  resolver.py  …
+│   └── gui/
+│       └── app.py  sidebar.py  panels.py  runner.py  …
+└── game_profiles/        # one subdirectory per supported game
+    └── <game_id>/
+        ├── <game_id>.json   # game profile definition
+        ├── state.json        # auto-managed symlink/backup records
+        ├── .nexus_cache/     # cached Nexus API responses and cover art
+        ├── mods/             # extracted mod folders
+        └── compressed/       # downloaded mod archives
 ```
 
-> `state.json`, `.venv/`, `.nexus_cache/`, `compressed/`, and `mods/` are in `.gitignore`.
+> Per-game `state.json`, `.nexus_cache/`, `mods/`, and `compressed/` are in `.gitignore`.
 
 ---
 
