@@ -23,3 +23,5 @@ __pycache__/
 *.rar
 config.json
 .claude/
+!compressed/Place Nexus Mods downloads here NO RENAME.txt
+!compressed-disabled/Script places unloadable (conflicts) mods here.txt

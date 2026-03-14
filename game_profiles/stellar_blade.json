@@ -1,0 +1,24 @@
+{
+  "id": "stellar_blade",
+  "name": "Stellar Blade",
+  "nexus_slug": "stellarblade",
+  "pak_extensions": [".pak", ".ucas", ".utoc", ".sig", ".json"],
+  "asset_extensions": [".uasset", ".ubulk", ".uexp", ".umap", ".uptnl"],
+  "utoc_strip_prefixes": ["../../../", "SB/Content/"],
+  "ignored_filenames": ["modinfo.ini", "1.png", "mods.txt"],
+  "install_rules": [
+    {"anchor": "SB",       "prefix": "",                  "case_insensitive": false},
+    {"anchor": "Binaries", "prefix": "SB",                "case_insensitive": false},
+    {"anchor": "Win64",    "prefix": "SB/Binaries",       "case_insensitive": false},
+    {"anchor": "ue4ss",    "prefix": "SB/Binaries/Win64", "case_insensitive": true},
+    {"anchor": "Content",  "prefix": "SB",                "case_insensitive": false},
+    {"anchor": "~mods",    "prefix": "SB/Content/Paks",   "case_insensitive": true, "bare_returns_none": true}
+  ],
+  "default_install_path": "SB/Content/Paks/~mods",
+  "special_extension_paths": {
+    ".json": "SB/Content/Paks/~mods/CustomNanosuitSystem"
+  },
+  "ue4ss": {
+    "mods_txt_rel_path": "SB/Binaries/Win64/ue4ss/Mods/mods.txt"
+  }
+}
