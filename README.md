@@ -1,5 +1,8 @@
 # Linux NM Mod Manager
 
+![alt text](https://github.com/Bugiboop/LinuxNMModManager/blob/main/screenshot.png?raw=true)
+
+
 > Symlink-based mod manager with a GUI and full CLI. Game-specific behaviour is defined by a small JSON **game profile**, making it easy to add support for any title.
 
 Currently includes a built-in profile for **Stellar Blade (PC / Steam, Linux)**.
