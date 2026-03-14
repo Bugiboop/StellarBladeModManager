@@ -1,8 +1,8 @@
 # Runtime data — local to each install, never commit
 state.json
-mods/*
-compressed/*
-compressed-disabled/*
+game_profiles/*/mods/*
+game_profiles/*/compressed/*
+game_profiles/*/compressed-disabled/*
 .nexus_cache/
 
 # Python virtual environment
@@ -23,5 +23,5 @@ __pycache__/
 *.rar
 config.json
 .claude/
-!compressed/Place Nexus Mods downloads here NO RENAME.txt
-!compressed-disabled/Script places unloadable (conflicts) mods here.txt
+!game_profiles/*/compressed/Place Nexus Mods downloads here NO RENAME.txt
+!game_profiles/*/compressed-disabled/Script places unloadable (conflicts) mods here.txt
