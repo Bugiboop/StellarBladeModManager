@@ -32,22 +32,10 @@ mkdir -p "${RELEASE_DIR}"
 cp dist/ModManager "${RELEASE_DIR}/ModManager"
 chmod +x "${RELEASE_DIR}/ModManager"
 
-# game_profiles — copy only the profile JSON + create empty data dirs
-# Skip any game directory that has no matching <id>.json (e.g. palworld stub)
-for profile_dir in game_profiles/*/; do
-    game_id="$(basename "${profile_dir}")"
-    json="${profile_dir}${game_id}.json"
-
-    if [ ! -f "${json}" ]; then
-        echo "[skip]  game_profiles/${game_id}/ has no profile JSON, skipping"
-        continue
-    fi
-
-    dest="${RELEASE_DIR}/game_profiles/${game_id}"
-    mkdir -p "${dest}/compressed" "${dest}/compressed-disabled" "${dest}/mods"
-    cp "${json}" "${dest}/"
-    echo "[copy]  game_profiles/${game_id}/${game_id}.json"
-done
+# game_profiles — create an empty directory only.
+# Profiles are downloaded from GitHub on first launch by mm/profiles.py.
+mkdir -p "${RELEASE_DIR}/game_profiles"
+echo "[skip]  game_profiles/ — profiles are fetched from GitHub at runtime"
 
 # Template config.json — game_root left blank for the user to fill in
 cat > "${RELEASE_DIR}/config.json" << 'JSON'

@@ -85,7 +85,17 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, ctk.CTk):
         threading.Thread(target=self._preload_nexus_cache, daemon=True).start()
 
     def _preload_nexus_cache(self):
-        """Read all cached Nexus JSON files from disk (background thread)."""
+        """Sync game profiles from GitHub, then read cached Nexus JSON files (background thread)."""
+        # Silently download any missing game profiles
+        try:
+            from mm.profiles import sync_profiles
+            downloaded, _ = sync_profiles(_gc._PROFILES_DIR)
+            if downloaded:
+                self.after(0, lambda d=downloaded: self._log_write(
+                    f"[profiles] Downloaded: {', '.join(d)}\n"))
+        except Exception:
+            pass
+
         cache = {}
         cache_dir = _gc._NEXUS_CACHE_DIR   # capture at thread-start time
         if cache_dir.exists():
@@ -278,8 +288,8 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, ctk.CTk):
 
         win = ctk.CTkToplevel(self)
         win.title(f"Settings — {game_name_label}")
-        win.geometry("580x530")
-        win.minsize(480, 440)
+        win.geometry("580x620")
+        win.minsize(480, 500)
         win.resizable(True, True)
         win.transient(self)
         win.withdraw()          # hide until fully built (prevents blank flash on Linux)
@@ -290,8 +300,8 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, ctk.CTk):
         # Center over main window
         self.update_idletasks()
         wx = self.winfo_x() + (self.winfo_width()  - 580) // 2
-        wy = self.winfo_y() + (self.winfo_height() - 530) // 2
-        win.geometry(f"580x530+{wx}+{wy}")
+        wy = self.winfo_y() + (self.winfo_height() - 620) // 2
+        win.geometry(f"580x620+{wx}+{wy}")
 
         scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
         scroll.grid(row=0, column=0, sticky="nsew")
@@ -386,6 +396,45 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, ctk.CTk):
             command=_clear_cache,
         ).grid(row=0, column=0, sticky="w")
         cache_info.grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        # ── Game Profiles ─────────────────────────────────────────────
+        row = _section_header("GAME PROFILES", row)
+
+        prof_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        prof_frame.grid(row=row, column=0, sticky="ew", padx=16, pady=(4, 0))
+        row += 1
+
+        prof_status = ctk.CTkLabel(prof_frame, text="",
+                                   font=ctk.CTkFont(size=11),
+                                   text_color=("gray50", "gray55"))
+
+        def _update_profiles():
+            prof_status.configure(text="Checking GitHub…")
+            prof_frame.update_idletasks()
+
+            def _do():
+                try:
+                    from mm.profiles import sync_profiles
+                    downloaded, failed = sync_profiles(_gc._PROFILES_DIR, force=True)
+                    if downloaded:
+                        msg = f"Updated: {', '.join(downloaded)}"
+                    elif failed:
+                        msg = f"Failed: {', '.join(failed)}"
+                    else:
+                        msg = "All profiles are up to date."
+                except Exception as exc:
+                    msg = f"Error: {exc}"
+                self.after(0, lambda: prof_status.configure(text=msg))
+
+            threading.Thread(target=_do, daemon=True).start()
+
+        ctk.CTkButton(
+            prof_frame, text="Update Game Profiles", width=160, height=28,
+            fg_color=("gray72", "gray30"), hover_color=("gray62", "gray38"),
+            font=ctk.CTkFont(size=11),
+            command=_update_profiles,
+        ).grid(row=0, column=0, sticky="w")
+        prof_status.grid(row=0, column=1, sticky="w", padx=(12, 0))
 
         # ── Paths ─────────────────────────────────────────────────────
         row = _section_header("PATHS", row)
