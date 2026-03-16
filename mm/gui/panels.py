@@ -32,21 +32,71 @@ class PanelsMixin:
                             fg_color=("gray95", "gray12"))
         main.grid(row=0, column=1, sticky="nsew")
         main.grid_columnconfigure(0, weight=1)
-        main.grid_rowconfigure(0, weight=1)   # info expands to fill remaining space
+        main.grid_rowconfigure(0, weight=0)   # nav bar (fixed height)
+        main.grid_rowconfigure(1, weight=1)   # page content (expands)
 
-        self._build_info_panel(main)
-        log_outer = self._build_log_panel(main)
-        log_outer.grid_propagate(False)       # fix log panel at explicit height
+        # ── Nav bar ───────────────────────────────────────────────────
+        nav = ctk.CTkFrame(main, height=38, fg_color=("gray88", "gray13"),
+                           corner_radius=0)
+        nav.grid(row=0, column=0, sticky="ew")
+        nav.grid_propagate(False)
+        nav.grid_columnconfigure(2, weight=1)
+
+        self._page_nav = ctk.CTkSegmentedButton(
+            nav, values=["Mods", "Downloads"],
+            font=ctk.CTkFont(size=12),
+            command=self._on_page_select,
+        )
+        self._page_nav.set("Mods")
+        self._page_nav.grid(row=0, column=0, padx=8, pady=5)
+
+        # Badge shows active download count
+        self._dl_nav_badge = ctk.CTkLabel(
+            nav, text="",
+            font=ctk.CTkFont(size=11),
+            text_color=("#c07010", "#c07010"),
+        )
+        self._dl_nav_badge.grid(row=0, column=1, padx=(0, 8), pady=5)
+
+        # ── Page frames ───────────────────────────────────────────────
+        self._page_mods = ctk.CTkFrame(main, fg_color="transparent",
+                                       corner_radius=0)
+        self._page_mods.grid(row=1, column=0, sticky="nsew")
+        self._page_mods.grid_columnconfigure(0, weight=1)
+        self._page_mods.grid_rowconfigure(0, weight=1)
+
+        self._page_downloads = ctk.CTkFrame(main, fg_color="transparent",
+                                            corner_radius=0)
+        self._page_downloads.grid(row=1, column=0, sticky="nsew")
+        self._page_downloads.grid_columnconfigure(0, weight=1)
+        self._page_downloads.grid_rowconfigure(0, weight=1)
+        self._page_downloads.grid_remove()   # hidden initially
+
+        # ── Mods page: info + log panels (unchanged layout) ───────────
+        self._build_info_panel(self._page_mods)
+        log_outer = self._build_log_panel(self._page_mods)
+        log_outer.grid_propagate(False)
 
         _last_h = [0]
         def _resize(_=None):
-            h = main.winfo_height()
+            h = self._page_mods.winfo_height()
             if h < 2 or h == _last_h[0]:
                 return
             _last_h[0] = h
             log_outer.configure(height=int(h * 0.30))
 
-        main.bind("<Configure>", _resize)
+        self._page_mods.bind("<Configure>", _resize)
+
+        # ── Downloads page ────────────────────────────────────────────
+        self._build_downloads_panel(self._page_downloads)
+
+    def _on_page_select(self, value: str):
+        if value == "Downloads":
+            self._page_mods.grid_remove()
+            self._page_downloads.grid()
+        else:
+            self._page_downloads.grid_remove()
+            self._page_mods.grid()
 
     # ── Info panel ────────────────────────────────────────────────────
 

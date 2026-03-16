@@ -20,6 +20,7 @@ from mm.gui.config import CONFIG_FILE, _PROFILES_DIR
 from .sidebar import SidebarMixin
 from .panels import PanelsMixin
 from .runner import RunnerMixin
+from .downloads import DownloadsMixin
 from .nexus import _nexus_id, _nexus_id_cache, _display_name
 from .dialogs import _InteractiveDialog, _detect_prompt
 from .info import _read_mod_info
@@ -30,10 +31,11 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
-class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, ctk.CTk):
+class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, DownloadsMixin, ctk.CTk):
 
-    def __init__(self):
+    def __init__(self, nxm_url: str | None = None):
         super().__init__()
+        self._pending_nxm = nxm_url
         self.title("Mod Manager")
         self.geometry("1260x780")
         self.minsize(960, 560)
@@ -80,6 +82,10 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, ctk.CTk):
         self.bind_all("<Up>",   self._on_arrow_key)
         self.bind_all("<Down>", self._on_arrow_key)
 
+        # Start IPC server so nxm:// links from a second invocation reach us
+        from mm.gui.ipc import start_server as _ipc_start
+        _ipc_start(lambda url: self.after(0, lambda u=url: self._on_nxm_received(u)))
+
         # Load nexus disk cache in a background thread so the window appears
         # immediately, then populate the mod list once the cache is ready.
         threading.Thread(target=self._preload_nexus_cache, daemon=True).start()
@@ -120,6 +126,17 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, ctk.CTk):
     def _finish_startup(self, cache: dict):
         self._nexus_cache.update(cache)
         self.refresh_mods()
+        # Process any NXM URL that was passed on the command line
+        if self._pending_nxm:
+            url = self._pending_nxm
+            self._pending_nxm = None
+            self.after(200, lambda u=url: self._on_nxm_received(u))
+
+    def _on_nxm_received(self, url: str):
+        """Switch to the Downloads page and queue the NXM URL."""
+        self._page_nav.set("Downloads")
+        self._on_page_select("Downloads")
+        self.queue_nxm_url(url)
 
     # ── Game switching ─────────────────────────────────────────────────
 
@@ -288,8 +305,8 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, ctk.CTk):
 
         win = ctk.CTkToplevel(self)
         win.title(f"Settings — {game_name_label}")
-        win.geometry("580x620")
-        win.minsize(480, 500)
+        win.geometry("580x720")
+        win.minsize(480, 560)
         win.resizable(True, True)
         win.transient(self)
         win.withdraw()          # hide until fully built (prevents blank flash on Linux)
@@ -300,8 +317,8 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, ctk.CTk):
         # Center over main window
         self.update_idletasks()
         wx = self.winfo_x() + (self.winfo_width()  - 580) // 2
-        wy = self.winfo_y() + (self.winfo_height() - 620) // 2
-        win.geometry(f"580x620+{wx}+{wy}")
+        wy = self.winfo_y() + (self.winfo_height() - 720) // 2
+        win.geometry(f"580x720+{wx}+{wy}")
 
         scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
         scroll.grid(row=0, column=0, sticky="nsew")
@@ -396,6 +413,34 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, ctk.CTk):
             command=_clear_cache,
         ).grid(row=0, column=0, sticky="w")
         cache_info.grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        # ── NXM Downloads ─────────────────────────────────────────────
+        row = _section_header("NXM DOWNLOADS", row)
+
+        nxm_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        nxm_frame.grid(row=row, column=0, sticky="ew", padx=16, pady=(4, 0))
+        row += 1
+
+        nxm_status = ctk.CTkLabel(
+            nxm_frame, text="",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray50", "gray55"),
+            wraplength=340, justify="left",
+        )
+
+        def _register_nxm():
+            from mm.gui.ipc import register_nxm_handler
+            from mm.gui.config import SCRIPT_DIR
+            msg = register_nxm_handler(SCRIPT_DIR)
+            nxm_status.configure(text=msg)
+
+        ctk.CTkButton(
+            nxm_frame, text="Register as NXM Handler", width=190, height=28,
+            fg_color=("gray72", "gray30"), hover_color=("gray62", "gray38"),
+            font=ctk.CTkFont(size=11),
+            command=_register_nxm,
+        ).grid(row=0, column=0, sticky="w")
+        nxm_status.grid(row=1, column=0, sticky="w", pady=(4, 0))
 
         # ── Game Profiles ─────────────────────────────────────────────
         row = _section_header("GAME PROFILES", row)
@@ -744,6 +789,6 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, ctk.CTk):
             self._update_info_panel(self._focused)
 
 
-def main():
-    app = ModManagerApp()
+def main(nxm_url: str | None = None):
+    app = ModManagerApp(nxm_url=nxm_url)
     app.mainloop()
