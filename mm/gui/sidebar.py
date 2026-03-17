@@ -19,7 +19,7 @@ class SidebarMixin:
                           fg_color=("gray90", "gray15"))
         sb.grid(row=0, column=0, sticky="nsew")
         sb.grid_propagate(False)
-        sb.grid_rowconfigure(2, weight=1)
+        sb.grid_rowconfigure(3, weight=1)
         sb.grid_columnconfigure(0, weight=1)
 
         hdr = ctk.CTkFrame(sb, fg_color="transparent")
@@ -84,8 +84,29 @@ class SidebarMixin:
             command=lambda _: self.refresh_mods(),
         ).grid(row=0, column=1, sticky="e")
 
+        filter_bar = ctk.CTkFrame(sb, fg_color="transparent")
+        filter_bar.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
+        filter_bar.grid_columnconfigure(0, weight=1)
+
+        self._filter_entry = ctk.CTkEntry(
+            filter_bar, textvariable=self._filter_var,
+            placeholder_text="Filter mods…",
+            height=26, font=ctk.CTkFont(size=11),
+        )
+        self._filter_entry.grid(row=0, column=0, sticky="ew")
+        self._filter_var.trace_add("write", self._on_filter_change)
+
+        _clear_filter_btn = ctk.CTkButton(
+            filter_bar, text="✕", width=26, height=26,
+            fg_color="transparent", hover_color=("gray70", "gray30"),
+            font=ctk.CTkFont(size=11),
+            command=lambda: self._filter_var.set(""),
+        )
+        _clear_filter_btn.grid(row=0, column=1, padx=(4, 0))
+        attach_tooltip(_clear_filter_btn, "Clear filter")
+
         list_outer = ctk.CTkFrame(sb, fg_color="transparent")
-        list_outer.grid(row=2, column=0, sticky="nsew", padx=6)
+        list_outer.grid(row=3, column=0, sticky="nsew", padx=6)
         list_outer.grid_rowconfigure(0, weight=1)
         list_outer.grid_columnconfigure(0, weight=1)
 
@@ -103,7 +124,7 @@ class SidebarMixin:
         self._vlist_canvas.bind("<Button-5>",   lambda _: self._vlist_scroll(1))
 
         btns = ctk.CTkFrame(sb, fg_color="transparent")
-        btns.grid(row=3, column=0, sticky="ew", padx=12, pady=12)
+        btns.grid(row=4, column=0, sticky="ew", padx=12, pady=12)
         btns.grid_columnconfigure((0, 1), weight=1)
 
         _ena_all = ctk.CTkButton(
@@ -189,8 +210,16 @@ class SidebarMixin:
 
     _SHELL_BATCH = 20  # outer shells to create per event-loop tick
 
-    def _vlist_batch_shells(self, start: int):
-        """Phase 1: create outer card shells in batches, keeping UI responsive."""
+    def _vlist_batch_shells(self, start: int, gen: int = -1):
+        """Phase 1: create outer card shells in batches, keeping UI responsive.
+
+        *gen* is the generation token from _apply_filter.  If _apply_filter has
+        been called again since this chain started, gen will not match
+        _vlist_batch_gen and the chain self-cancels immediately.
+        """
+        if gen >= 0 and gen != self._vlist_batch_gen:
+            return   # superseded by a newer filter/refresh — abort
+
         canvas   = self._vlist_canvas
         canvas_w = max(canvas.winfo_width() - 4, 10)
         items    = self._vlist_items
@@ -216,7 +245,7 @@ class SidebarMixin:
             self._vlist_render()
 
         if end < len(items):
-            self.after(0, lambda: self._vlist_batch_shells(end))
+            self.after(0, lambda: self._vlist_batch_shells(end, gen))
 
     def _vlist_create_shell(self, item: dict) -> ctk.CTkFrame:
         """Phase 1: create the outer card frame (border only, no internal widgets)."""

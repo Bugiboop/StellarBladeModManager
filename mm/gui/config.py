@@ -95,3 +95,8 @@ def _load_state() -> dict:
         with open(_STATE_FILE) as f:
             return json.load(f)
     return {"mods": {}}
+
+
+def _save_state(state: dict) -> None:
+    with open(_STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)

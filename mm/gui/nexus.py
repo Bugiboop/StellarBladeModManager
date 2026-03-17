@@ -48,5 +48,21 @@ def _display_name(folder: str) -> str:
     return re.sub(r"[-_]\d+(?:[-_]\d+)*$", "", folder).strip("-_ ") or folder
 
 
+def _nexus_file_version(folder: str) -> str | None:
+    """Extract the version string between the mod ID and the timestamp.
+
+    e.g. 'SomeMod-89-1-0-1234567890' → '1.0'
+         'SomeMod-89-HighRes-1234567890' → 'HighRes'
+    """
+    m = re.search(r"-\d{1,7}-(.+)-\d{9,}$", folder)
+    if m and m.group(1):
+        v = m.group(1)
+        # Convert digit-only dash-separated versions to dotted form
+        if re.fullmatch(r"[\d-]+", v):
+            v = v.replace("-", ".")
+        return v
+    return None
+
+
 def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", " ", text).strip()

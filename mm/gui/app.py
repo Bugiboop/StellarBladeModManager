@@ -21,7 +21,7 @@ from .sidebar import SidebarMixin
 from .panels import PanelsMixin
 from .runner import RunnerMixin
 from .downloads import DownloadsMixin
-from .nexus import _nexus_id, _nexus_id_cache, _display_name
+from .nexus import _nexus_id, _nexus_id_cache, _display_name, _nexus_file_version
 from .dialogs import _InteractiveDialog, _detect_prompt
 from .info import _read_mod_info
 from .constants import _ARCHIVE_EXTENSIONS, _CARD_NORMAL, _CARD_FOCUSED, _CARD_CHECKED, _CARD_H, _SEP_H, _V_PAD
@@ -60,6 +60,14 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, DownloadsMixin, ctk.
         self._archived:       dict = {}  # stem → Path for archives with no extracted folder
         self._name_labels:    dict = {}  # mod name → CTkLabel (for live Nexus name update)
         self._sort_var      = ctk.StringVar(value="Name A→Z")
+        self._filter_var    = ctk.StringVar()
+        self._filter_after_id: str|None = None
+        # Cached unfiltered mod data (populated by refresh_mods, read by _apply_filter)
+        self._mods_item_cache:    dict = {}   # name → item dict
+        self._archive_item_cache: dict = {}   # stem → item dict
+        self._all_mods_sorted:    list = []   # full sorted mod list (unfiltered)
+        self._archived_sorted:    list = []   # full sorted archive stems (unfiltered)
+        self._dup_nids:           set  = set() # Nexus IDs with >1 installed package
         self._current_game: str  = "stellar_blade"
         self._profile:      dict = {}
         self._game_var      = ctk.StringVar(value="Stellar Blade")
@@ -74,6 +82,7 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, DownloadsMixin, ctk.
         self._vlist_widgets:      dict     = {}   # idx → {"frame": CTkFrame, "cid": int}
         self._vlist_populated:    set      = set()# indices whose shells have been filled
         self._vlist_render_after: str|None = None # pending debounce id
+        self._vlist_batch_gen:    int      = 0    # incremented to cancel stale batch chains
 
         self._build_sidebar()
         self._build_main()
@@ -630,64 +639,38 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, DownloadsMixin, ctk.
                     if p.stem not in self._on_disk and p.stem not in tracked:
                         self._archived[p.stem] = p
 
-        self._all_mods = all_mods + sorted(self._archived.keys())
-
         self._selected &= self._on_disk
         if self._focused not in self._on_disk and \
                 self._focused not in self._archived:
             self._focused = None
 
-        # Destroy all currently-rendered virtual cards
-        for w_data in self._vlist_widgets.values():
-            try:
-                w_data["frame"].destroy()
-            except Exception:
-                pass
-        self._vlist_widgets.clear()
-        self._vlist_populated.clear()
-        self._switches.clear()
-        self._cards.clear()
-        self._checkboxvars.clear()
-        self._name_labels.clear()
+        # Detect Nexus IDs that appear more than once (multiple packages of same mod)
+        from collections import Counter
+        nid_counts = Counter(_nexus_id(n) for n in all_mods if _nexus_id(n))
+        self._dup_nids = {nid for nid, cnt in nid_counts.items() if cnt >= 2}
 
-        # Build the virtual items list
-        items: list  = []
-        yoffs: list  = []
-        y = 0
+        # Cache item dicts so _apply_filter can rebuild without touching disk
         enabled = 0
+        self._mods_item_cache = {}
         for name in all_mods:
-            ms       = state["mods"].get(name, {})
-            is_on    = ms.get("enabled", False)
+            ms    = state["mods"].get(name, {})
+            is_on = ms.get("enabled", False)
             if is_on:
                 enabled += 1
-            items.append({
+            self._mods_item_cache[name] = {
                 "type":     "mod",
                 "name":     name,
                 "disp":     self._get_disp_name(name),
                 "is_on":    is_on,
                 "symlinks": len(ms.get("symlinks", [])),
                 "exists":   name in self._on_disk,
-            })
-            yoffs.append(y)
-            y += _CARD_H + _V_PAD
-
-        if self._archived:
-            items.append({"type": "sep", "name": "AVAILABLE ARCHIVES"})
-            yoffs.append(y)
-            y += _SEP_H + _V_PAD
-            for stem in sorted(self._archived.keys()):
-                items.append({
-                    "type": "archive",
-                    "name": stem,
-                    "disp": _display_name(stem),
-                })
-                yoffs.append(y)
-                y += _CARD_H + _V_PAD
-
-        self._vlist_items   = items
-        self._vlist_yoffs   = yoffs
-        self._vlist_total_h = y
-        self._vlist_canvas.configure(scrollregion=(0, 0, 0, max(y, 1)))
+            }
+        self._archive_item_cache = {
+            stem: {"type": "archive", "name": stem, "disp": _display_name(stem)}
+            for stem in self._archived
+        }
+        self._all_mods_sorted  = list(all_mods)
+        self._archived_sorted  = sorted(self._archived.keys())
 
         self._count_label.configure(text=f"{enabled}/{len(all_mods)}")
         self._status.configure(
@@ -697,6 +680,7 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, DownloadsMixin, ctk.
                     if self._archived else "")
         )
         self._update_selection_ui()
+        self._apply_filter()
 
         # Kick off background Nexus fetches for all mods with a known ID
         api_key = cfg.get("nexus_api_key", "")
@@ -712,11 +696,115 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, DownloadsMixin, ctk.
                         daemon=True,
                     ).start()
 
-        # Phase 1: batch-create all outer card shells (deferred so window stays
-        # responsive). Visible shells are populated immediately in _vlist_render.
-        self.after(0, lambda: self._vlist_batch_shells(0))
-
         self._update_info_panel(self._focused)
+        self._update_launch_button()
+
+    # ── Filter ────────────────────────────────────────────────────────
+
+    def _on_filter_change(self, *_):
+        if self._filter_after_id:
+            self.after_cancel(self._filter_after_id)
+        self._filter_after_id = self.after(150, self._apply_filter)
+
+    def _apply_filter(self):
+        self._filter_after_id = None
+        query = self._filter_var.get().strip().lower()
+
+        # Bump generation so any in-flight _vlist_batch_shells chain self-cancels
+        self._vlist_batch_gen += 1
+        gen = self._vlist_batch_gen
+
+        # Collect old frames and clear tracking dicts immediately (don't block here)
+        old_frames = [w["frame"] for w in self._vlist_widgets.values()]
+        self._vlist_widgets.clear()
+        self._vlist_populated.clear()
+        self._switches.clear()
+        self._cards.clear()
+        self._checkboxvars.clear()
+        self._name_labels.clear()
+
+        # Destroy old frames in small batches so keypresses aren't starved
+        def _destroy_batch(frames: list, idx: int):
+            for f in frames[idx:idx + 15]:
+                try:
+                    f.destroy()
+                except Exception:
+                    pass
+            if idx + 15 < len(frames):
+                self.after(0, lambda: _destroy_batch(frames, idx + 15))
+
+        if old_frames:
+            self.after(0, lambda: _destroy_batch(old_frames, 0))
+
+        items: list = []
+        yoffs: list = []
+        y = 0
+        nav_mods: list = []
+
+        for name in self._all_mods_sorted:
+            item = self._mods_item_cache.get(name)
+            if not item:
+                continue
+            if query and query not in item["disp"].lower() \
+                     and query not in name.lower():
+                continue
+            items.append(item)
+            yoffs.append(y)
+            y += _CARD_H + _V_PAD
+            nav_mods.append(name)
+
+        visible_archives = [
+            stem for stem in self._archived_sorted
+            if not query
+               or query in self._archive_item_cache[stem]["disp"].lower()
+               or query in stem.lower()
+        ]
+        if visible_archives:
+            items.append({"type": "sep", "name": "AVAILABLE ARCHIVES"})
+            yoffs.append(y)
+            y += _SEP_H + _V_PAD
+            for stem in visible_archives:
+                items.append(self._archive_item_cache[stem])
+                yoffs.append(y)
+                y += _CARD_H + _V_PAD
+                nav_mods.append(stem)
+
+        self._all_mods      = nav_mods
+        self._vlist_items   = items
+        self._vlist_yoffs   = yoffs
+        self._vlist_total_h = y
+
+        # Preserve scroll position when refreshing; reset only when filter changes
+        saved_frac = self._vlist_canvas.yview()[0]
+        self._vlist_canvas.configure(scrollregion=(0, 0, 0, max(y, 1)))
+        if query != getattr(self, "_last_filter_query", None):
+            saved_frac = 0.0
+        self._last_filter_query = query
+        self._vlist_canvas.yview_moveto(saved_frac)
+
+        # Immediately create shells for the visible viewport so cards appear
+        # without needing a scroll nudge, then batch-create the rest in the bg.
+        canvas   = self._vlist_canvas
+        canvas_w = max(canvas.winfo_width() - 4, 10)
+        canvas_h = canvas.winfo_height()
+        y_top    = canvas.canvasy(0)
+        y_bot    = canvas.canvasy(max(canvas_h, 1))
+        buf      = _CARD_H * 3
+        for i, (item, yo) in enumerate(zip(items, yoffs)):
+            h = _SEP_H if item["type"] == "sep" else _CARD_H
+            if yo + h >= y_top - buf and yo <= y_bot + buf:
+                shell = self._vlist_create_shell(item)
+                cid   = canvas.create_window(2, yo, window=shell,
+                                             anchor="nw", width=canvas_w)
+                self._vlist_widgets[i] = {"frame": shell, "cid": cid}
+                if item["type"] in ("mod", "archive"):
+                    self._cards[item["name"]] = shell
+                if item["type"] == "sep":
+                    self._vlist_populated.add(i)
+        self._vlist_render()
+
+        # Phase 1: batch-create remaining shells in the background
+        self.after(0, lambda g=gen: self._vlist_batch_shells(0, g))
 
     # ── Nexus API background fetch ────────────────────────────────────
 
@@ -761,12 +849,22 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, DownloadsMixin, ctk.
         self.after(0, lambda: self._maybe_refresh_nexus(nid))
 
     def _get_disp_name(self, name: str) -> str:
-        """Return Nexus mod name if cached, otherwise cleaned folder name."""
+        """Return Nexus mod name if cached, otherwise cleaned folder name.
+
+        When multiple installed mods share the same Nexus ID (different packages
+        of the same mod), the version from the folder name is appended so the
+        user can tell them apart.
+        """
         nid = _nexus_id(name)
         if nid:
             nd = self._nexus_cache.get(nid)
             if nd and not nd.get("_error") and nd.get("name"):
-                return nd["name"]
+                nexus_name = nd["name"]
+                if nid in self._dup_nids:
+                    v = _nexus_file_version(name)
+                    if v:
+                        return f"{nexus_name}  [{v}]"
+                return nexus_name
         return _display_name(name)
 
     def _maybe_refresh_nexus(self, nid: str):
@@ -778,7 +876,7 @@ class ModManagerApp(SidebarMixin, PanelsMixin, RunnerMixin, DownloadsMixin, ctk.
                 if _nexus_id(mod_name) == nid:
                     try:
                         if lbl.winfo_exists():
-                            lbl.configure(text=nexus_name)
+                            lbl.configure(text=self._get_disp_name(mod_name))
                     except Exception:
                         pass
             # Re-sort if a new mod name just arrived (only uncached mods reach here)

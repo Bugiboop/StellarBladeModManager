@@ -50,7 +50,9 @@ def enable_mod(mod_name: str, cfg: dict, state: dict, target_map: dict = None, g
         return
 
     # --- Variant detection: prune unselected version folders before enabling ---
-    groups = detect_variant_groups(mod_dir)
+    profile = cfg.get("profile", {})
+    anchors = {rule["anchor"].lower() for rule in profile.get("install_rules", [])}
+    groups = detect_variant_groups(mod_dir, anchor_names=anchors)
     for parent_dir, variants in groups:
         chosen = prompt_variant_choice(parent_dir, variants)
         if chosen is not None:
@@ -95,10 +97,20 @@ def enable_mod(mod_name: str, cfg: dict, state: dict, target_map: dict = None, g
     symlinks = []
     backups = []
     skipped = 0
+    disabled_stems = set(mod_state.get("disabled_files", []))
 
     for src_file in iter_mod_files(mod_dir):
         target = resolve_target(mod_dir, src_file, game_root, profile, game_tree)
         if target is None:
+            continue
+
+        if src_file.stem in disabled_stems:
+            mod_state.setdefault("disabled_symlinks", [])
+            entry = {"link": str(target), "target": str(src_file)}
+            existing = [e["target"] for e in mod_state["disabled_symlinks"]]
+            if str(src_file) not in existing:
+                mod_state["disabled_symlinks"].append(entry)
+            skipped += 1
             continue
 
         if str(target) in skip_targets:
@@ -182,6 +194,7 @@ def disable_mod(mod_name: str, cfg: dict, state: dict):
     mod_state["enabled"] = False
     mod_state["symlinks"] = []
     mod_state["backups"] = []
+    mod_state.pop("disabled_symlinks", None)   # clear on full disable
     save_state(state)
 
     parts = [f"{unlinked} unlinked"]
@@ -190,3 +203,66 @@ def disable_mod(mod_name: str, cfg: dict, state: dict):
     if restored:
         parts.append(f"{restored} restored")
     print(f"[disabled] {mod_name}  —  {', '.join(parts)}")
+
+
+def toggle_mod_file_stem(mod_name: str, stem: str, enable: bool,
+                         cfg: dict, state: dict) -> None:
+    """Enable or disable all files with *stem* inside an already-enabled mod.
+
+    Moves entries between ``symlinks`` (active) and ``disabled_symlinks``
+    (parked) and creates / removes the physical symlinks accordingly.
+    ``disabled_files`` (a list of stems) is kept in sync so that a subsequent
+    ``enable_mod`` call respects the same choices.
+    """
+    ms = state["mods"].get(mod_name)
+    if ms is None:
+        return
+
+    # Keep disabled_files (stems) in sync
+    disabled_stems: set = set(ms.get("disabled_files", []))
+    if enable:
+        disabled_stems.discard(stem)
+    else:
+        disabled_stems.add(stem)
+    ms["disabled_files"] = sorted(disabled_stems)
+
+    if not ms.get("enabled", False):
+        save_state(state)
+        return
+
+    active   = ms.get("symlinks", [])
+    parked   = ms.get("disabled_symlinks", [])
+
+    if enable:
+        # Move matching entries from parked → active and recreate symlinks
+        still_parked = []
+        for entry in parked:
+            if Path(entry["target"]).stem == stem:
+                link   = Path(entry["link"])
+                target = Path(entry["target"])
+                if target.exists():
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    if link.is_symlink():
+                        link.unlink()
+                    os.symlink(target, link)
+                    active.append(entry)
+                    print(f"  [file-enabled]  {link.name}")
+            else:
+                still_parked.append(entry)
+        ms["disabled_symlinks"] = still_parked
+    else:
+        # Move matching entries from active → parked and remove symlinks
+        still_active = []
+        for entry in active:
+            if Path(entry["target"]).stem == stem:
+                link = Path(entry["link"])
+                if link.is_symlink():
+                    link.unlink()
+                parked.append(entry)
+                print(f"  [file-disabled] {link.name}")
+            else:
+                still_active.append(entry)
+        ms["symlinks"]          = still_active
+        ms["disabled_symlinks"] = parked
+    # Caller is responsible for saving state (GUI uses _gc._save_state to reach
+    # the correct game-specific state file; CLI callers call mm.config.save_state)

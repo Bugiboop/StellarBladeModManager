@@ -31,7 +31,17 @@ def _has_mod_files(directory: Path) -> bool:
     return False
 
 
-def detect_variant_groups(mod_dir: Path) -> list:
+def _mod_filenames(directory: Path) -> set:
+    """Return the set of lowercase mod filenames (basename only) within directory."""
+    names = set()
+    for root, _dirs, files in os.walk(directory):
+        for f in files:
+            if Path(f).suffix.lower() in config.PAK_EXTENSIONS:
+                names.add(f.lower())
+    return names
+
+
+def detect_variant_groups(mod_dir: Path, anchor_names: set = None) -> list:
     """
     Walk mod_dir and find directories whose sole purpose is to offer a choice
     between 2+ variant subdirectories (e.g. Transparent/, Opaque/, v1/, v2/).
@@ -39,10 +49,17 @@ def detect_variant_groups(mod_dir: Path) -> list:
     A directory qualifies as a variant-group parent when:
       - It contains no PAK_EXTENSIONS files directly
       - It has 2+ immediate subdirectories that each contain at least one mod file
+        AND whose names are not known game-structure anchors (e.g. ~mods, LogicMods)
+
+    anchor_names: optional set of lowercase anchor names from the game profile's
+    install_rules.  Subdirs matching an anchor are treated as install-target folders
+    (components), not as alternate versions of the same content, and are excluded
+    from variant consideration.
 
     Returns list of (parent_dir, [variant_subdir, ...]) tuples, shallowest first.
     Stops recursing into a level once a variant group is found there.
     """
+    _anchors = anchor_names or set()
     results = []
 
     def _walk(directory: Path):
@@ -53,10 +70,23 @@ def detect_variant_groups(mod_dir: Path) -> list:
         direct_mod_files = [e for e in entries if e.is_file() and e.suffix.lower() in config.PAK_EXTENSIONS]
         subdirs = sorted([e for e in entries if e.is_dir()], key=lambda p: p.name)
         if not direct_mod_files and len(subdirs) >= 2:
-            variant_subdirs = [d for d in subdirs if _has_mod_files(d)]
-            if len(variant_subdirs) >= 2:
-                results.append((directory, variant_subdirs))
-                return  # don't recurse; user will prune unwanted variants
+            candidates = [
+                d for d in subdirs
+                if _has_mod_files(d) and d.name.lower() not in _anchors
+            ]
+            if len(candidates) >= 2:
+                # Only treat as true variants if they share mod filenames.
+                # Separate components (Animations/, Cosmetics/) have unique filenames
+                # and should all be installed; true variants (1K/, 4K/) share names.
+                subdir_names = {d: _mod_filenames(d) for d in candidates}
+                from collections import Counter
+                name_counts = Counter(n for names in subdir_names.values() for n in names)
+                shared = {n for n, c in name_counts.items() if c >= 2}
+                if shared:
+                    variant_subdirs = [d for d in candidates if subdir_names[d] & shared]
+                    if len(variant_subdirs) >= 2:
+                        results.append((directory, variant_subdirs))
+                        return  # don't recurse; user will prune unwanted variants
         for subdir in subdirs:
             _walk(subdir)
 
@@ -127,7 +157,9 @@ def extract_archives(cfg: dict, force: bool = False, archive_name: str = None):
             _extract_7z(archive, dest)
 
         # --- variant selection ---
-        groups = detect_variant_groups(dest)
+        profile = cfg.get("profile", {})
+        anchors = {rule["anchor"].lower() for rule in profile.get("install_rules", [])}
+        groups = detect_variant_groups(dest, anchor_names=anchors)
         for parent_dir, variants in groups:
             chosen = prompt_variant_choice(parent_dir, variants)
             if chosen is not None:

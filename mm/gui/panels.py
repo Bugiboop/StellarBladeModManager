@@ -40,7 +40,7 @@ class PanelsMixin:
                            corner_radius=0)
         nav.grid(row=0, column=0, sticky="ew")
         nav.grid_propagate(False)
-        nav.grid_columnconfigure(2, weight=1)
+        nav.grid_columnconfigure(2, weight=1)   # spacer pushes right-side buttons to the edge
 
         self._page_nav = ctk.CTkSegmentedButton(
             nav, values=["Mods", "Downloads"],
@@ -57,6 +57,27 @@ class PanelsMixin:
             text_color=("#c07010", "#c07010"),
         )
         self._dl_nav_badge.grid(row=0, column=1, padx=(0, 8), pady=5)
+
+        # Asset Search button
+        _search_btn = ctk.CTkButton(
+            nav, text="🔍  Asset Search", height=28,
+            fg_color="transparent", border_width=1,
+            font=ctk.CTkFont(size=12),
+            command=self._open_asset_search,
+        )
+        _search_btn.grid(row=0, column=3, sticky="e", padx=(0, 8), pady=5)
+        attach_tooltip(_search_btn,
+                       "Search inside mod files for an internal game asset path or string")
+
+        # Launch Game (Steam) — right side of nav bar
+        self._btn_launch_steam = ctk.CTkButton(
+            nav, text="▶  Launch Game (Steam)", height=28,
+            fg_color=("#1b5e9e", "#1a4f7a"), hover_color=("#1565c0", "#1a6aaa"),
+            font=ctk.CTkFont(size=12),
+            command=self._launch_steam,
+        )
+        self._btn_launch_steam.grid(row=0, column=4, sticky="e", padx=(0, 10), pady=5)
+        attach_tooltip(self._btn_launch_steam, "Launch the game via Steam")
 
         # ── Page frames ───────────────────────────────────────────────
         self._page_mods = ctk.CTkFrame(main, fg_color="transparent",
@@ -137,7 +158,7 @@ class PanelsMixin:
 
         tab_bar = ctk.CTkFrame(outer, fg_color=_INACTIVE, corner_radius=0, height=30)
         tab_bar.grid(row=1, column=0, sticky="ew")
-        tab_bar.grid_columnconfigure((0, 1), weight=1)
+        tab_bar.grid_columnconfigure((0, 1, 2), weight=1)
         tab_bar.grid_propagate(False)
 
         self._tab_info_btn = ctk.CTkButton(
@@ -148,13 +169,21 @@ class PanelsMixin:
         )
         self._tab_info_btn.grid(row=0, column=0, sticky="nsew")
 
+        self._tab_files_btn = ctk.CTkButton(
+            tab_bar, text="Files", corner_radius=0, height=30,
+            fg_color=_INACTIVE, hover_color=_HOVER,
+            font=ctk.CTkFont(size=12),
+            command=lambda: self._switch_info_tab("files"),
+        )
+        self._tab_files_btn.grid(row=0, column=1, sticky="nsew")
+
         self._tab_assets_btn = ctk.CTkButton(
             tab_bar, text="Assets", corner_radius=0, height=30,
             fg_color=_INACTIVE, hover_color=_HOVER,
             font=ctk.CTkFont(size=12),
             command=lambda: self._switch_info_tab("assets"),
         )
-        self._tab_assets_btn.grid(row=0, column=1, sticky="nsew")
+        self._tab_assets_btn.grid(row=0, column=2, sticky="nsew")
 
         # Content container — both scrollable frames stacked here; only one shown
         content = ctk.CTkFrame(outer, fg_color=_BG, corner_radius=0)
@@ -173,6 +202,16 @@ class PanelsMixin:
         self._info_scroll.grid_columnconfigure(0, weight=1)
         self._bind_scroll(self._info_scroll, self._info_scroll)
 
+        self._files_scroll = ctk.CTkScrollableFrame(
+            content, fg_color="transparent",
+            scrollbar_button_color=("gray70", "gray30"),
+            scrollbar_button_hover_color=("gray60", "gray40"),
+        )
+        self._files_scroll.grid(row=0, column=0, sticky="nsew")
+        self._files_scroll.grid_columnconfigure(0, weight=1)
+        self._bind_scroll(self._files_scroll, self._files_scroll)
+        self._files_scroll.grid_remove()
+
         self._assets_scroll = ctk.CTkScrollableFrame(
             content, fg_color="transparent",
             scrollbar_button_color=("gray70", "gray30"),
@@ -185,6 +224,7 @@ class PanelsMixin:
 
         self._active_info_tab = "info"
         self._assets_mod_dir  = None
+        self._files_mod_name  = None
 
         # Initial placeholder
         self._show_info_placeholder("← Select a mod to view details")
@@ -203,15 +243,25 @@ class PanelsMixin:
 
     def _switch_info_tab(self, tab: str):
         self._active_info_tab = tab
+        # Hide all content panes
+        self._info_scroll.grid_remove()
+        self._files_scroll.grid_remove()
+        self._assets_scroll.grid_remove()
+        # Reset all tab button colours
+        for btn in (self._tab_info_btn, self._tab_files_btn, self._tab_assets_btn):
+            btn.configure(fg_color=_INACTIVE)
+
         if tab == "info":
             self._tab_info_btn.configure(fg_color=_BG)
-            self._tab_assets_btn.configure(fg_color=_INACTIVE)
-            self._assets_scroll.grid_remove()
             self._info_scroll.grid()
+        elif tab == "files":
+            self._tab_files_btn.configure(fg_color=_BG)
+            self._files_scroll.grid()
+            if self._focused:
+                self._files_mod_name = self._focused
+                self._load_files_tab(self._focused)
         else:
             self._tab_assets_btn.configure(fg_color=_BG)
-            self._tab_info_btn.configure(fg_color=_INACTIVE)
-            self._info_scroll.grid_remove()
             self._assets_scroll.grid()
             mod_dir = self._folder_path
             if mod_dir and mod_dir != self._assets_mod_dir:
@@ -288,6 +338,110 @@ class PanelsMixin:
                              text_color=("gray30", "gray72"), anchor="w",
                              ).grid(row=row, column=0, sticky="w", padx=8)
                 row += 1
+
+    # ── Files tab ─────────────────────────────────────────────────────
+
+    def _load_files_tab(self, mod_name: str):
+        for w in self._files_scroll.winfo_children():
+            w.destroy()
+
+        ms = self._state["mods"].get(mod_name, {})
+        active  = ms.get("symlinks", [])
+        parked  = ms.get("disabled_symlinks", [])
+        is_enabled = ms.get("enabled", False)
+        all_entries = active + parked
+        if not all_entries:
+            lbl = ctk.CTkLabel(
+                self._files_scroll,
+                text="No placed files recorded for this mod.\n"
+                     "Enable the mod first to see its files here.",
+                font=ctk.CTkFont(size=12),
+                text_color=("gray55", "gray50"),
+            )
+            lbl.grid(row=0, column=0, pady=30, padx=12)
+            self._bind_scroll(lbl, self._files_scroll)
+            return
+
+        # Group by stem so .pak/.utoc/.ucas appear as one row
+        from pathlib import Path as _P
+        from collections import defaultdict
+        disabled_stems = set(ms.get("disabled_files", []))
+        groups: dict = defaultdict(list)
+        for entry in all_entries:
+            stem = _P(entry["target"]).stem
+            groups[stem].append(entry)
+
+        game_root = self._cfg.get("game_root")
+
+        row = 0
+        for stem in sorted(groups):
+            entries   = groups[stem]
+            is_active = stem not in disabled_stems
+            exts      = sorted({_P(e["target"]).suffix for e in entries})
+            ext_str   = "  ".join(exts)
+            # Destination directory (from first entry's link path)
+            dest_dir  = str(_P(entries[0]["link"]).parent)
+            if game_root:
+                try:
+                    dest_dir = str(_P(dest_dir).relative_to(game_root))
+                except ValueError:
+                    pass
+
+            row_frame = ctk.CTkFrame(
+                self._files_scroll, fg_color="transparent",
+            )
+            row_frame.grid(row=row, column=0, sticky="ew", padx=8, pady=2)
+            row_frame.grid_columnconfigure(1, weight=1)
+
+            sw_var = ctk.BooleanVar(value=is_active)
+            sw = ctk.CTkSwitch(
+                row_frame, text="", variable=sw_var,
+                width=40, onvalue=True, offvalue=False,
+                command=lambda s=stem, v=sw_var: self._toggle_mod_file(mod_name, s, v),
+            )
+            sw.grid(row=0, column=0, padx=(0, 8))
+
+            name_lbl = ctk.CTkLabel(
+                row_frame, text=stem,
+                font=ctk.CTkFont(size=12),
+                text_color=("gray15", "gray85") if is_active else ("gray55", "gray45"),
+                anchor="w",
+            )
+            name_lbl.grid(row=0, column=1, sticky="w")
+
+            ctk.CTkLabel(
+                row_frame, text=ext_str,
+                font=ctk.CTkFont(size=10),
+                text_color=("gray55", "gray50"),
+                anchor="e",
+            ).grid(row=0, column=2, padx=(4, 0))
+
+            dest_lbl = ctk.CTkLabel(
+                self._files_scroll, text=dest_dir,
+                font=ctk.CTkFont(size=10),
+                text_color=("gray55", "gray45"),
+                anchor="w",
+            )
+            dest_lbl.grid(row=row + 1, column=0, sticky="w", padx=(60, 8), pady=(0, 4))
+
+            self._bind_scroll(row_frame, self._files_scroll)
+            self._bind_scroll(dest_lbl,  self._files_scroll)
+
+            row += 2
+
+    def _toggle_mod_file(self, mod_name: str, stem: str, var: "ctk.BooleanVar"):
+        from mm.mods import toggle_mod_file_stem
+        enable = var.get()
+        action = "enabled" if enable else "disabled"
+        try:
+            toggle_mod_file_stem(mod_name, stem, enable, self._cfg, self._state)
+            _gc._save_state(self._state)   # save via GUI path — mm.config.STATE_FILE is wrong here
+            self._log_write(f"[file-{action}]  {stem}  ({mod_name})\n")
+        except Exception as e:
+            self._log_write(f"[error] Could not toggle {stem}: {e}\n")
+        # Refresh the tab to reflect the new state
+        self._files_mod_name = None
+        self._load_files_tab(mod_name)
 
     def _show_archive_info(self, name: str, arch_path):
         """Info panel content for an archive that hasn't been extracted yet."""
@@ -400,9 +554,12 @@ class PanelsMixin:
         self._folder_btn.grid_remove()
         self._nexus_btn.grid_remove()
         self._info_img_ref = None
-        # Reset assets tab so it reloads for the new mod
+        # Reset tab caches so they reload for the new mod
         self._assets_mod_dir = None
+        self._files_mod_name = None
         for w in self._assets_scroll.winfo_children():
+            w.destroy()
+        for w in self._files_scroll.winfo_children():
             w.destroy()
 
         if name is None:
@@ -635,10 +792,13 @@ class PanelsMixin:
                              text_color=("gray55", "gray50"), anchor="w",
                              ).grid(row=limit, column=0, sticky="w")
 
-        # If assets tab is already visible, load assets for the new mod now
+        # If assets/files tab is already visible, reload it for the new mod now
         if self._active_info_tab == "assets" and self._folder_path:
             self._assets_mod_dir = self._folder_path
             self._load_assets_tab(self._folder_path)
+        elif self._active_info_tab == "files" and name:
+            self._files_mod_name = name
+            self._load_files_tab(name)
 
     # ── Image zoom overlay ────────────────────────────────────────────
 
@@ -881,6 +1041,36 @@ class PanelsMixin:
             self._log_write("[cancelled]\n")
             return
         self._run_bg(["--uninstall", name], on_done=self.refresh_mods)
+
+    # ── Steam launch ──────────────────────────────────────────────────
+
+    def _open_asset_search(self):
+        from .asset_search import AssetSearchWindow
+        AssetSearchWindow(self, self._state)
+
+    def _launch_steam(self):
+        app_id = self._profile.get("steam_app_id") if self._profile else None
+        if not app_id:
+            tkmsgbox.showwarning(
+                "No Steam App ID",
+                "This game profile does not have a steam_app_id set.\n"
+                "Add  \"steam_app_id\": \"<id>\"  to its profile JSON.",
+            )
+            return
+        try:
+            subprocess.Popen(["steam", f"steam://run/{app_id}"])
+        except FileNotFoundError:
+            tkmsgbox.showerror("Steam Not Found",
+                               "Could not find the 'steam' executable.\n"
+                               "Make sure Steam is installed and on your PATH.")
+
+    def _update_launch_button(self):
+        """Show or hide the Launch button depending on whether the profile has a Steam app ID."""
+        has_id = bool(self._profile.get("steam_app_id") if self._profile else False)
+        if has_id:
+            self._btn_launch_steam.grid()
+        else:
+            self._btn_launch_steam.grid_remove()
 
     # ── Status bar ────────────────────────────────────────────────────
 

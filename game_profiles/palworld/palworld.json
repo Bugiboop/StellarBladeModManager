@@ -24,5 +24,6 @@
   },
   "ue4ss": {
     "mods_txt_rel_path": "Pal/Binaries/Win64/ue4ss/Mods/mods.txt"
-  }
+  },
+  "steam_app_id": "1623730"
 }
